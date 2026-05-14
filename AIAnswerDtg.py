@@ -19,6 +19,7 @@ LOCK = "🛡️"
 FIRE = "🔥"
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/chat/completions"
+LIMIT_ERROR = "__AI_LIMIT_REACHED__"
 
 DEFAULT_TOXIC_PROMPT = (
     "Ты Telegram-автоответчик в стиле живого токсичного чела из чата. "
@@ -44,6 +45,7 @@ class AIAnswerDtgMod(loader.Module):
             "<code>.aitoken sk-...</code> — сохранить DeepSeek API токен\n"
             "<code>.aiprompt [текст]</code> — задать свой промпт/роль\n"
             "<code>.aitoxic</code> — поставить готовый токсичный промпт\n"
+            "<code>.ailimitreply [текст]</code> — текст вместо ошибки лимита\n"
             "<code>.aimodel [модель]</code> — выбрать модель, по умолчанию <code>deepseek-v4-flash</code>\n"
             "<code>.aicooldown [сек]</code> — задержка ответов, по умолчанию 12 сек\n\n"
             "<b>💎 Управление</b>\n"
@@ -53,7 +55,8 @@ class AIAnswerDtgMod(loader.Module):
             "<code>.aitest [текст]</code> — проверить ответ без включения автоответчика\n"
             "<code>.aiclear</code> — очистить короткую память чата\n\n"
             "<b>🛡️ Логика</b>\n"
-            "Отвечает на входящие сообщения в активном чате, не отвечает сам себе, не трогает команды с точкой/слэшем, держит cooldown, хранит короткий контекст.\n\n"
+            "Отвечает на входящие сообщения в активном чате, не отвечает сам себе, не трогает команды с точкой/слэшем, держит cooldown, хранит короткий контекст.\n"
+            "Если DeepSeek упёрся в лимит/баланс — в чат не кидает ошибку API, а отвечает заданной заглушкой.\n\n"
             "<b>🔵 Где взять токен:</b> https://platform.deepseek.com/api_keys\n"
         ),
     }
@@ -75,6 +78,7 @@ class AIAnswerDtgMod(loader.Module):
             "model": "deepseek-v4-flash",
             "cooldown": 12,
             "max_memory": 8,
+            "limit_reply": "иди нахуй",
             "enabled_chats": {},
         })
 
@@ -88,6 +92,14 @@ class AIAnswerDtgMod(loader.Module):
             return "скрыт"
         return f"{token[:7]}...{token[-4:]}"
 
+    def is_limit_error(self, status, msg):
+        text = (msg or "").lower()
+        markers = (
+            "rate limit", "rate_limit", "too many requests", "quota", "insufficient_quota",
+            "balance", "insufficient balance", "exceeded", "limit", "billing", "credits",
+        )
+        return status == 429 or any(marker in text for marker in markers)
+
     def normalize_cfg(self, cfg):
         if "enabled_chats" not in cfg:
             cfg["enabled_chats"] = {}
@@ -97,6 +109,8 @@ class AIAnswerDtgMod(loader.Module):
             cfg["prompt"] = DEFAULT_TOXIC_PROMPT
         if not cfg.get("cooldown"):
             cfg["cooldown"] = 12
+        if "limit_reply" not in cfg:
+            cfg["limit_reply"] = "иди нахуй"
         return cfg
 
     async def ask_ai(self, cfg, chat_id, user_text):
@@ -135,6 +149,8 @@ class AIAnswerDtgMod(loader.Module):
                     if resp.status >= 400:
                         err = data.get("error", {}) if isinstance(data, dict) else {}
                         msg = err.get("message") or str(data)[:500]
+                        if self.is_limit_error(resp.status, msg):
+                            return None, LIMIT_ERROR
                         return None, f"DeepSeek ошибка {resp.status}: {msg}"
         except Exception as e:
             return None, f"Ошибка запроса к DeepSeek: {e}"
@@ -189,6 +205,16 @@ class AIAnswerDtgMod(loader.Module):
         self.save_cfg(cfg)
         await utils.answer(message, f"{FIRE} <b>Токсичный короткий промпт установлен.</b>\n{BLUE}<code>{utils.escape_html(DEFAULT_TOXIC_PROMPT[:700])}</code>")
 
+    async def ailimitreplycmd(self, message):
+        """[текст] — что писать вместо ошибки лимита DeepSeek."""
+        text = utils.get_args_raw(message).strip()
+        cfg = self.normalize_cfg(self.cfg())
+        if not text:
+            return await utils.answer(message, f"{BLUE} <b>Текущий ответ при лимите:</b> <code>{utils.escape_html(cfg.get('limit_reply', 'иди нахуй'))}</code>")
+        cfg["limit_reply"] = text[:300]
+        self.save_cfg(cfg)
+        await utils.answer(message, f"{OK} <b>Ответ при лимите сохранён:</b> <code>{utils.escape_html(cfg['limit_reply'])}</code>")
+
     async def aimodelcmd(self, message):
         """[модель] — выбрать модель. Пример: .aimodel deepseek-v4-flash"""
         model = utils.get_args_raw(message).strip()
@@ -239,6 +265,7 @@ class AIAnswerDtgMod(loader.Module):
             f"{BLUE} <b>Модель:</b> <code>{utils.escape_html(cfg.get('model', 'deepseek-v4-flash'))}</code>\n"
             f"{CLOCK} <b>Cooldown:</b> <code>{cfg.get('cooldown', 12)} сек.</code>\n"
             f"{INFO} <b>API:</b> <code>DeepSeek /chat/completions</code>\n"
+            f"{FIRE} <b>Лимит-ответ:</b> <code>{utils.escape_html(cfg.get('limit_reply', 'иди нахуй'))}</code>\n"
             f"{FIRE} <b>Промпт:</b> <code>{utils.escape_html(cfg.get('prompt', '')[:500])}</code>"
         )
 
@@ -249,6 +276,9 @@ class AIAnswerDtgMod(loader.Module):
             return await utils.answer(message, f"{BLUE} <b>Формат:</b> <code>.aitest ну что ты несёшь?</code>")
         loading = await utils.answer(message, f"{BOT} <b>DeepSeek думает...</b>")
         answer, err = await self.ask_ai(self.cfg(), message.chat_id, text)
+        if err == LIMIT_ERROR:
+            cfg = self.normalize_cfg(self.cfg())
+            return await utils.answer(loading, f"{FIRE} <b>Лимит DeepSeek. В чате бот ответит:</b> <code>{utils.escape_html(cfg.get('limit_reply', 'иди нахуй'))}</code>")
         if err:
             return await utils.answer(loading, f"{BLUE} <b>{utils.escape_html(err)}</b>")
         await utils.answer(loading, f"{BOT} <b>Ответ:</b>\n{utils.escape_html(answer)}")
@@ -291,6 +321,10 @@ class AIAnswerDtgMod(loader.Module):
                     answer, err = await self.ask_ai(cfg, message.chat_id, text)
             except Exception:
                 answer, err = await self.ask_ai(cfg, message.chat_id, text)
+
+            if err == LIMIT_ERROR:
+                await message.reply(utils.escape_html(cfg.get("limit_reply", "иди нахуй")))
+                return
 
             if err:
                 await message.reply(f"{BLUE} <b>AIAnswerDtg:</b> <code>{utils.escape_html(err)}</code>")

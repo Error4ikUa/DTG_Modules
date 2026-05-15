@@ -174,11 +174,35 @@ def list_text(query: str, results: list[dict]) -> str:
 
 
 async def send_inline(event, text: str, *, buttons=None, link_preview=False):
+    """Send via DeathTG inline manager if available, otherwise safe fallback.
+
+    Local DeathTG builds may expose different inline helper method names. This
+    function probes them instead of assuming Hikka-style send_or_edit().
+    """
     app = getattr(getattr(event, "client", None), "deathtg_app", None)
     inline = getattr(app, "inline", None)
+
     if inline:
-        return await inline.send_or_edit(event, text, buttons=buttons, parse_mode="html", link_preview=link_preview)
-    return await event.edit(text, buttons=buttons, parse_mode="html", link_preview=link_preview)
+        for method_name in ("send_or_edit", "form", "send", "answer"):
+            method = getattr(inline, method_name, None)
+            if not method:
+                continue
+            try:
+                if method_name == "form":
+                    return await method(text, message=event, reply_markup=buttons, ttl=3600)
+                return await method(event, text, buttons=buttons, parse_mode="html", link_preview=link_preview)
+            except TypeError:
+                try:
+                    return await method(event.chat_id, text, buttons=buttons)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    try:
+        return await event.edit(text, buttons=buttons, parse_mode="html", link_preview=link_preview)
+    except Exception:
+        return await event.respond(text, buttons=buttons, parse_mode="html", link_preview=link_preview)
 
 
 async def http_get_json(url: str, headers: dict | None = None):

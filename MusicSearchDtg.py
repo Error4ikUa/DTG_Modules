@@ -23,25 +23,24 @@ from telethon import Button, events
 from deathtg.command import command
 
 BLUE = "🔵"
+MUSIC = "🎧"
+APPLE = "🍎"
+SPOTIFY = "🟢"
+SC = "🟠"
 OK = "🔷"
 INFO = "💎"
-MUSIC = "🎧"
-SPOTIFY = "🟢"
-APPLE = "🍎"
-SC = "🟠"
 WARN = "🌀"
 
 CONFIG_FILE = Path(__file__).with_suffix(".json")
 SPOTIFY_CACHE = {"token": "", "expires": 0}
-PROVIDER_EMOJI = {"spotify": SPOTIFY, "apple": APPLE, "soundcloud": SC}
 SEARCH_CACHE: dict[str, dict] = {}
 CALLBACK_REGISTERED: set[int] = set()
+PROVIDER_EMOJI = {"apple": APPLE, "spotify": SPOTIFY, "soundcloud": SC}
 
 DEFAULT_CFG = {
     "spotify_client_id": "",
     "spotify_client_secret": "",
     "soundcloud_token": "",
-    "default_limit": 3,
 }
 
 
@@ -65,9 +64,7 @@ def save_cfg(cfg: dict) -> None:
 
 
 def argline(args) -> str:
-    if isinstance(args, (list, tuple)):
-        return " ".join(str(x) for x in args).strip()
-    return str(args or "").strip()
+    return " ".join(str(x) for x in args).strip() if isinstance(args, (list, tuple)) else str(args or "").strip()
 
 
 def mask(value: str) -> str:
@@ -86,14 +83,11 @@ def norm(text: str) -> str:
 
 def score(query: str, title: str, artist: str) -> float:
     q = norm(query)
-    target = norm(f"{title} {artist}")
     title_n = norm(title)
+    target = norm(f"{title} {artist}")
     if not q or not target:
         return 0
-    ratio = SequenceMatcher(None, q, target).ratio()
-    title_ratio = SequenceMatcher(None, q, title_n).ratio()
-    bonus = 0.35 if q in title_n else 0
-    return ratio + title_ratio + bonus
+    return SequenceMatcher(None, q, target).ratio() + SequenceMatcher(None, q, title_n).ratio() + (0.35 if q in title_n else 0)
 
 
 def dedupe_sort(query: str, results: list[dict], limit: int = 3) -> list[dict]:
@@ -104,7 +98,7 @@ def dedupe_sort(query: str, results: list[dict], limit: int = 3) -> list[dict]:
         if not key or key in seen:
             continue
         seen.add(key)
-        item["score"] = score(query, item.get("title"), item.get("artist"))
+        item["score"] = score(query, item.get("title", ""), item.get("artist", ""))
         clean.append(item)
     clean.sort(key=lambda x: x.get("score", 0), reverse=True)
     return clean[:limit]
@@ -125,23 +119,26 @@ def provider_from_url(url: str) -> str:
     return "unknown"
 
 
-def card(item: dict) -> str:
-    emoji = PROVIDER_EMOJI.get(item.get("provider"), MUSIC)
-    title = html.escape(item.get("title") or "Unknown")
-    artist = html.escape(item.get("artist") or "Unknown")
-    album = html.escape(item.get("album") or "")
-    provider = html.escape(item.get("provider", "music"))
-    url = html.escape(item.get("url") or "")
-    preview = html.escape(item.get("preview_url") or "")
-    text = f"{emoji} <b>{title}</b>\n{BLUE} <b>Артист:</b> <code>{artist}</code>\n"
-    if album:
-        text += f"{INFO} <b>Альбом:</b> <code>{album}</code>\n"
-    text += f"{MUSIC} <b>Источник:</b> <code>{provider}</code>\n"
-    if preview and preview != url:
-        text += f"{OK} <b>Preview:</b> <code>{preview}</code>\n"
-    if url:
-        text += f"\n<a href=\"{url}\">🔵 Открыть трек</a>"
-    return text
+def safe_name(text: str) -> str:
+    text = re.sub(r"[^a-zA-Zа-яА-ЯёЁіїєґІЇЄҐ0-9 ._-]+", "", text or "track").strip()
+    text = re.sub(r"\s+", " ", text)
+    return (text or "track")[:80]
+
+
+def item_name(item: dict) -> str:
+    return f"{item.get('artist') or 'Unknown'} - {item.get('title') or 'Track'}"
+
+
+def list_text(query: str, results: list[dict]) -> str:
+    lines = [f"{MUSIC} <b>Нашёл 3 подходящие песни по запросу:</b> <code>{html.escape(query)}</code>\n"]
+    for i, item in enumerate(results, 1):
+        emoji = PROVIDER_EMOJI.get(item.get("provider"), MUSIC)
+        title = html.escape(item.get("title") or "Unknown")
+        artist = html.escape(item.get("artist") or "Unknown")
+        provider = html.escape(item.get("provider") or "music")
+        lines.append(f"<b>{i}.</b> {emoji} <b>{title}</b> — <code>{artist}</code> <i>({provider})</i>")
+    lines.append("\n🔷 <i>Нажми кнопку — трек отправится в чат.</i>")
+    return "\n".join(lines)
 
 
 def picker_buttons(key: str, results: list[dict]):
@@ -154,25 +151,8 @@ def picker_buttons(key: str, results: list[dict]):
     return rows or None
 
 
-def single_buttons(item: dict):
-    rows = []
-    if item.get("url"):
-        rows.append([Button.url("🔵 Открыть трек", item["url"])])
-    if item.get("preview_url") and item.get("preview_url") != item.get("url"):
-        rows.append([Button.url("🎧 Preview", item["preview_url"])])
-    return rows or None
-
-
-def list_text(query: str, results: list[dict]) -> str:
-    lines = [f"{MUSIC} <b>Нашёл 3 подходящие песни по запросу:</b> <code>{html.escape(query)}</code>\n"]
-    for i, item in enumerate(results, 1):
-        emoji = PROVIDER_EMOJI.get(item.get("provider"), MUSIC)
-        title = html.escape(item.get("title") or "Unknown")
-        artist = html.escape(item.get("artist") or "Unknown")
-        provider = html.escape(item.get("provider") or "music")
-        lines.append(f"<b>{i}.</b> {emoji} <b>{title}</b> — <code>{artist}</code> <i>({provider})</i>")
-    lines.append("\n🔷 <i>Нажми кнопку ниже — выбранный трек отправится в чат.</i>")
-    return "\n".join(lines)
+def open_button(item: dict):
+    return [[Button.url("🔵 Открыть трек", item["url"])] ] if item.get("url") else None
 
 
 def get_app(event):
@@ -246,21 +226,27 @@ async def send_picker(event, text: str, results: list[dict]):
     return await event.edit(text, buttons=buttons, parse_mode="html", link_preview=False)
 
 
-async def send_card(event, text: str, *, buttons=None, link_preview=True):
-    try:
-        return await event.edit(text, buttons=buttons, parse_mode="html", link_preview=link_preview)
-    except Exception:
-        return await event.respond(text, buttons=buttons, parse_mode="html", link_preview=link_preview)
+async def http_get_json(url: str, headers: dict | None = None):
+    timeout = aiohttp.ClientTimeout(total=25)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers=headers or {}) as resp:
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = {}
+            if resp.status >= 400:
+                return None, f"HTTP {resp.status}: {str(data)[:300]}"
+            return data, None
 
 
-async def download_preview(url: str) -> str | None:
+async def download_preview(url: str, item: dict | None = None) -> str | None:
     if not url or not url.startswith("http"):
         return None
-    suffix = Path(urlparse(url).path).suffix or ".mp3"
+    suffix = Path(urlparse(url).path).suffix or ".m4a"
     if len(suffix) > 8:
-        suffix = ".mp3"
-    fd, path = tempfile.mkstemp(prefix="dtg_music_", suffix=suffix)
-    os.close(fd)
+        suffix = ".m4a"
+    filename = safe_name(item_name(item or {})) + suffix
+    path = str(Path(tempfile.gettempdir()) / filename)
     try:
         timeout = aiohttp.ClientTimeout(total=45)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -279,6 +265,23 @@ async def download_preview(url: str) -> str | None:
         return None
 
 
+async def send_audio_only(client, chat_id, item: dict) -> bool:
+    preview = item.get("preview_url") or ""
+    if not preview or preview == item.get("url"):
+        return False
+    path = await download_preview(preview, item)
+    if not path:
+        return False
+    try:
+        await client.send_file(chat_id, path, caption="", force_document=False)
+        return True
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
 async def track_callback_handler(event):
     try:
         data = (event.data or b"").decode(errors="ignore")
@@ -292,47 +295,16 @@ async def track_callback_handler(event):
         await event.answer("Не нашёл этот трек в кеше", alert=True)
         return
 
-    await event.answer("Выбрал трек, готовлю...", alert=False)
+    await event.answer("Кидаю трек...", alert=False)
+    ok = await send_audio_only(event.client, event.chat_id, item)
+    if ok:
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        return
 
-    preview = item.get("preview_url") or ""
-    path = await download_preview(preview) if preview and preview != item.get("url") else None
-
-    try:
-        if path:
-            try:
-                await event.delete()
-            except Exception:
-                pass
-            await event.client.send_file(
-                event.chat_id,
-                path,
-                caption=card(item),
-                parse_mode="html",
-                buttons=single_buttons(item),
-                link_preview=True,
-            )
-            return
-
-        await event.edit(card(item), buttons=single_buttons(item), parse_mode="html", link_preview=True)
-    finally:
-        if path:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-
-
-async def http_get_json(url: str, headers: dict | None = None):
-    timeout = aiohttp.ClientTimeout(total=25)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers or {}) as resp:
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:
-                data = {}
-            if resp.status >= 400:
-                return None, f"HTTP {resp.status}: {str(data)[:300]}"
-            return data, None
+    await event.answer("У этого трека нет аудио-превью", alert=True)
 
 
 async def apple_search(query: str, limit: int = 5) -> list[dict]:
@@ -340,17 +312,14 @@ async def apple_search(query: str, limit: int = 5) -> list[dict]:
     data, err = await http_get_json(url)
     if err or not data:
         return []
-    out = []
-    for x in data.get("results", []):
-        out.append({
-            "provider": "apple",
-            "title": x.get("trackName") or "Unknown",
-            "artist": x.get("artistName") or "Unknown",
-            "album": x.get("collectionName") or "",
-            "url": x.get("trackViewUrl") or x.get("collectionViewUrl") or "",
-            "preview_url": x.get("previewUrl") or "",
-        })
-    return out
+    return [{
+        "provider": "apple",
+        "title": x.get("trackName") or "Unknown",
+        "artist": x.get("artistName") or "Unknown",
+        "album": x.get("collectionName") or "",
+        "url": x.get("trackViewUrl") or x.get("collectionViewUrl") or "",
+        "preview_url": x.get("previewUrl") or "",
+    } for x in data.get("results", [])]
 
 
 async def apple_lookup(url: str):
@@ -419,8 +388,7 @@ async def spotify_search(query: str, limit: int = 5) -> list[dict]:
     token = await spotify_token()
     if not token:
         return []
-    url = f"https://api.spotify.com/v1/search?q={quote(query)}&type=track&limit={int(limit)}"
-    data, err = await http_get_json(url, headers={"Authorization": f"Bearer {token}"})
+    data, err = await http_get_json(f"https://api.spotify.com/v1/search?q={quote(query)}&type=track&limit={int(limit)}", headers={"Authorization": f"Bearer {token}"})
     if err or not data:
         return []
     return [spotify_item(x) for x in data.get("tracks", {}).get("items", [])]
@@ -434,9 +402,7 @@ async def spotify_lookup(url: str):
     if not m:
         return None
     data, err = await http_get_json(f"https://api.spotify.com/v1/tracks/{m.group(1)}", headers={"Authorization": f"Bearer {token}"})
-    if err or not data:
-        return None
-    return spotify_item(data)
+    return None if err or not data else spotify_item(data)
 
 
 def soundcloud_headers():
@@ -446,13 +412,12 @@ def soundcloud_headers():
 
 def soundcloud_item(x: dict) -> dict:
     user = x.get("user", {}) or {}
-    permalink = x.get("permalink_url") or x.get("uri") or ""
     return {
         "provider": "soundcloud",
         "title": x.get("title") or "Unknown",
         "artist": user.get("username") or x.get("publisher_metadata", {}).get("artist") or "Unknown",
         "album": x.get("label_name") or "",
-        "url": permalink,
+        "url": x.get("permalink_url") or x.get("uri") or "",
         "preview_url": "",
     }
 
@@ -461,25 +426,12 @@ async def soundcloud_search(query: str, limit: int = 5) -> list[dict]:
     headers = soundcloud_headers()
     if not headers:
         return []
-    url = f"https://api.soundcloud.com/tracks?q={quote(query)}&limit={int(limit)}"
-    data, err = await http_get_json(url, headers=headers)
+    data, err = await http_get_json(f"https://api.soundcloud.com/tracks?q={quote(query)}&limit={int(limit)}", headers=headers)
     if err or not data:
         return []
     if isinstance(data, dict):
         data = data.get("collection", [])
     return [soundcloud_item(x) for x in data if isinstance(x, dict)]
-
-
-async def soundcloud_oembed(url: str):
-    data, err = await http_get_json(f"https://soundcloud.com/oembed?format=json&url={quote(url)}")
-    if err or not data:
-        return None
-    title = data.get("title") or "SoundCloud"
-    artist = "SoundCloud"
-    if " by " in title:
-        left, right = title.rsplit(" by ", 1)
-        title, artist = left.strip(), right.strip()
-    return {"provider": "soundcloud", "title": title, "artist": artist, "album": "", "url": url, "preview_url": ""}
 
 
 async def soundcloud_lookup(url: str):
@@ -488,7 +440,7 @@ async def soundcloud_lookup(url: str):
         data, err = await http_get_json(f"https://api.soundcloud.com/resolve?url={quote(url)}", headers=headers)
         if not err and isinstance(data, dict) and data.get("kind") == "track":
             return soundcloud_item(data)
-    return await soundcloud_oembed(url)
+    return {"provider": "soundcloud", "title": "SoundCloud", "artist": "Unknown", "album": "", "url": url, "preview_url": ""}
 
 
 async def search_all(query: str) -> list[dict]:
@@ -523,20 +475,20 @@ async def tr_cmd(event, args: list[str]) -> None:
     if is_url(query):
         item = await lookup_link(query)
         if not item:
-            await event.edit(
-                f"{WARN} <b>Не смог распознать ссылку.</b>\n{INFO} Для Spotify нужны <code>.trspotify client_id client_secret</code>, для SoundCloud желательно <code>.trsoundcloud token</code>.",
-                parse_mode="html",
-            )
+            await event.edit(f"{WARN} <b>Не смог распознать ссылку.</b>", parse_mode="html")
             return
-        await send_card(event, card(item), buttons=single_buttons(item), link_preview=True)
+        if await send_audio_only(event.client, event.chat_id, item):
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            return
+        await event.edit(f"{WARN} <b>У этого трека нет аудио-превью.</b>", parse_mode="html", buttons=open_button(item))
         return
 
     results = await search_all(query)
     if not results:
-        await event.edit(
-            f"{WARN} <b>Ничего не нашёл.</b>\n{INFO} Apple работает без токена. Для Spotify/SoundCloud задай ключи через <code>.trspotify</code> и <code>.trsoundcloud</code>.",
-            parse_mode="html",
-        )
+        await event.edit(f"{WARN} <b>Ничего не нашёл.</b>", parse_mode="html")
         return
 
     await send_picker(event, list_text(query, results), results)
@@ -544,13 +496,9 @@ async def tr_cmd(event, args: list[str]) -> None:
 
 @command("trspotify", description="Сохранить Spotify API ключи", usage=".trspotify client_id client_secret")
 async def trspotify_cmd(event, args: list[str]) -> None:
-    raw = argline(args)
-    parts = raw.split(maxsplit=1)
+    parts = argline(args).split(maxsplit=1)
     if len(parts) < 2:
-        await event.edit(
-            f"{SPOTIFY} <b>Формат:</b> <code>.trspotify client_id client_secret</code>\n{INFO} Создай app в Spotify Developer Dashboard.",
-            parse_mode="html",
-        )
+        await event.edit(f"{SPOTIFY} <b>Формат:</b> <code>.trspotify client_id client_secret</code>", parse_mode="html")
         return
     cfg = load_cfg()
     cfg["spotify_client_id"] = parts[0].strip()
@@ -564,10 +512,7 @@ async def trspotify_cmd(event, args: list[str]) -> None:
 async def trsoundcloud_cmd(event, args: list[str]) -> None:
     token = argline(args)
     if not token:
-        await event.edit(
-            f"{SC} <b>Формат:</b> <code>.trsoundcloud token</code>\n{INFO} Нужен SoundCloud API/OAuth token. Без него ссылки SoundCloud частично работают через oEmbed, но поиск может не работать.",
-            parse_mode="html",
-        )
+        await event.edit(f"{SC} <b>Формат:</b> <code>.trsoundcloud token</code>", parse_mode="html")
         return
     cfg = load_cfg()
     cfg["soundcloud_token"] = token

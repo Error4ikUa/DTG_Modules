@@ -42,7 +42,7 @@ class MusicSearchDtgMod(Module):
         self.spotify_cache = {"token": "", "expires": 0}
         self.config_path = Path(__file__).with_suffix(".json")
 
-    # ---------- config ----------
+    # -------------------- config --------------------
 
     def load_cfg(self) -> dict:
         cfg = self.DEFAULT_CFG.copy()
@@ -65,12 +65,12 @@ class MusicSearchDtgMod(Module):
         except Exception:
             pass
 
-    # ---------- tiny helpers ----------
+    # -------------------- helpers --------------------
 
     @staticmethod
     def args_text(args) -> str:
         if isinstance(args, (list, tuple)):
-            return " ".join(str(x) for x in args).strip()
+            return " ".join(str(item) for item in args).strip()
         return str(args or "").strip()
 
     @staticmethod
@@ -137,7 +137,7 @@ class MusicSearchDtgMod(Module):
         clean.sort(key=lambda item: item.get("score", 0), reverse=True)
         return clean[:limit]
 
-    # ---------- ui ----------
+    # -------------------- ui --------------------
 
     def result_text(self, query: str, results: list[dict]) -> str:
         lines = [f"<b>Found 3 matching tracks:</b> <code>{self.esc(query)}</code>", ""]
@@ -166,7 +166,7 @@ class MusicSearchDtgMod(Module):
             {
                 "text": "Close",
                 "callback": self.close_callback,
-                "args": (key,),
+                "args": (),
             }
         ])
         return self.inline_buttons(*rows)
@@ -191,10 +191,10 @@ class MusicSearchDtgMod(Module):
             rows.append([{"text": "Open", "url": item["url"]}])
         if key:
             rows.append([{"text": "Back", "callback": self.back_callback, "args": (key,)}])
-        rows.append([{"text": "Close", "callback": self.close_callback, "args": (key,)}])
+        rows.append([{"text": "Close", "callback": self.close_callback, "args": ()}])
         return self.inline_buttons(*rows)
 
-    # ---------- http ----------
+    # -------------------- http --------------------
 
     async def get_json(self, url: str, headers: dict | None = None):
         timeout = aiohttp.ClientTimeout(total=25)
@@ -208,24 +208,24 @@ class MusicSearchDtgMod(Module):
                     return None
                 return data
 
-    # ---------- Apple/iTunes ----------
+    # -------------------- Apple/iTunes --------------------
 
     async def apple_search(self, query: str, limit: int = 5) -> list[dict]:
         url = f"https://itunes.apple.com/search?term={quote(query)}&media=music&entity=song&limit={int(limit)}"
         data = await self.get_json(url)
         if not data:
             return []
-        items = []
-        for raw in data.get("results", []):
-            items.append({
+        return [
+            {
                 "provider": "apple",
-                "title": raw.get("trackName") or "Unknown",
-                "artist": raw.get("artistName") or "Unknown",
-                "album": raw.get("collectionName") or "",
-                "url": raw.get("trackViewUrl") or raw.get("collectionViewUrl") or "",
-                "preview_url": raw.get("previewUrl") or "",
-            })
-        return items
+                "title": item.get("trackName") or "Unknown",
+                "artist": item.get("artistName") or "Unknown",
+                "album": item.get("collectionName") or "",
+                "url": item.get("trackViewUrl") or item.get("collectionViewUrl") or "",
+                "preview_url": item.get("previewUrl") or "",
+            }
+            for item in data.get("results", [])
+        ]
 
     async def apple_lookup(self, url: str):
         parsed = urlparse(url)
@@ -237,6 +237,7 @@ class MusicSearchDtgMod(Module):
                 track_id = match.group(1)
         if not track_id:
             return None
+
         data = await self.get_json(f"https://itunes.apple.com/lookup?id={quote(track_id)}&entity=song")
         if not data:
             return None
@@ -253,7 +254,7 @@ class MusicSearchDtgMod(Module):
             "preview_url": song.get("previewUrl") or "",
         }
 
-    # ---------- Spotify ----------
+    # -------------------- Spotify --------------------
 
     async def spotify_token(self):
         cfg = self.load_cfg()
@@ -281,16 +282,16 @@ class MusicSearchDtgMod(Module):
         return token
 
     @staticmethod
-    def spotify_item(raw: dict) -> dict:
-        artists = ", ".join(artist.get("name", "") for artist in raw.get("artists", []) if artist.get("name")) or "Unknown"
-        album = raw.get("album", {}) or {}
+    def spotify_item(item: dict) -> dict:
+        artists = ", ".join(artist.get("name", "") for artist in item.get("artists", []) if artist.get("name")) or "Unknown"
+        album = item.get("album", {}) or {}
         return {
             "provider": "spotify",
-            "title": raw.get("name") or "Unknown",
+            "title": item.get("name") or "Unknown",
             "artist": artists,
             "album": album.get("name") or "",
-            "url": (raw.get("external_urls") or {}).get("spotify") or "",
-            "preview_url": raw.get("preview_url") or "",
+            "url": (item.get("external_urls") or {}).get("spotify") or "",
+            "preview_url": item.get("preview_url") or "",
         }
 
     async def spotify_search(self, query: str, limit: int = 5) -> list[dict]:
@@ -316,21 +317,21 @@ class MusicSearchDtgMod(Module):
         )
         return self.spotify_item(data) if data else None
 
-    # ---------- SoundCloud ----------
+    # -------------------- SoundCloud --------------------
 
     def soundcloud_headers(self):
         token = self.load_cfg().get("soundcloud_token", "").strip()
         return {"Authorization": f"OAuth {token}"} if token else None
 
     @staticmethod
-    def soundcloud_item(raw: dict) -> dict:
-        user = raw.get("user", {}) or {}
+    def soundcloud_item(item: dict) -> dict:
+        user = item.get("user", {}) or {}
         return {
             "provider": "soundcloud",
-            "title": raw.get("title") or "Unknown",
-            "artist": user.get("username") or raw.get("publisher_metadata", {}).get("artist") or "Unknown",
-            "album": raw.get("label_name") or "",
-            "url": raw.get("permalink_url") or raw.get("uri") or "",
+            "title": item.get("title") or "Unknown",
+            "artist": user.get("username") or item.get("publisher_metadata", {}).get("artist") or "Unknown",
+            "album": item.get("label_name") or "",
+            "url": item.get("permalink_url") or item.get("uri") or "",
             "preview_url": "",
         }
 
@@ -351,9 +352,16 @@ class MusicSearchDtgMod(Module):
             data = await self.get_json(f"https://api.soundcloud.com/resolve?url={quote(url)}", headers=headers)
             if isinstance(data, dict) and data.get("kind") == "track":
                 return self.soundcloud_item(data)
-        return {"provider": "soundcloud", "title": "SoundCloud", "artist": "Unknown", "album": "", "url": url, "preview_url": ""}
+        return {
+            "provider": "soundcloud",
+            "title": "SoundCloud",
+            "artist": "Unknown",
+            "album": "",
+            "url": url,
+            "preview_url": "",
+        }
 
-    # ---------- search core ----------
+    # -------------------- search core --------------------
 
     async def search_all(self, query: str) -> list[dict]:
         tasks = [self.apple_search(query, 5), self.spotify_search(query, 5), self.soundcloud_search(query, 5)]
@@ -373,7 +381,7 @@ class MusicSearchDtgMod(Module):
             return await self.soundcloud_lookup(url)
         return None
 
-    # ---------- audio ----------
+    # -------------------- audio --------------------
 
     async def download_preview(self, url: str, item: dict) -> str | None:
         if not url or not url.startswith("http"):
@@ -416,7 +424,7 @@ class MusicSearchDtgMod(Module):
             except Exception:
                 pass
 
-    # ---------- command ----------
+    # -------------------- command --------------------
 
     @command("tr", description="Search music", usage=".tr query_or_link | .tr status | .tr spotify id secret | .tr soundcloud token")
     async def tr_cmd(self, event, args):
@@ -474,8 +482,6 @@ class MusicSearchDtgMod(Module):
         self.cache[key] = {
             "query": text,
             "results": results,
-            "chat_id": event.chat_id,
-            "client": event.client,
             "time": time.time(),
         }
 
@@ -521,7 +527,7 @@ class MusicSearchDtgMod(Module):
         self.save_cfg(cfg)
         await event.edit("<b>SoundCloud token saved.</b>", parse_mode="html")
 
-    # ---------- callbacks ----------
+    # -------------------- callbacks --------------------
 
     async def select_callback(self, call, key: str, index: int):
         pack = self.cache.get(key)
@@ -535,8 +541,8 @@ class MusicSearchDtgMod(Module):
             return
 
         item = results[index]
-        client = pack.get("client") or getattr(self, "client", None)
-        chat_id = pack.get("chat_id")
+        client = getattr(call, "original_client", None)
+        chat_id = getattr(call, "original_chat_id", None)
 
         if client and chat_id:
             ok = await self.send_preview_audio(client, chat_id, item)
@@ -563,7 +569,5 @@ class MusicSearchDtgMod(Module):
             link_preview=False,
         )
 
-    async def close_callback(self, call, key: str | None = None):
-        if key:
-            self.cache.pop(key, None)
+    async def close_callback(self, call):
         await call.edit("Closed.", reply_markup=None)

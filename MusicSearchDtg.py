@@ -8,14 +8,17 @@ import asyncio
 import base64
 import html
 import json
+import os
 import re
+import secrets
+import tempfile
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import quote, urlparse, parse_qs
 
 import aiohttp
-from telethon import Button
+from telethon import Button, events
 
 from deathtg.command import command
 
@@ -31,6 +34,8 @@ WARN = "🌀"
 CONFIG_FILE = Path(__file__).with_suffix(".json")
 SPOTIFY_CACHE = {"token": "", "expires": 0}
 PROVIDER_EMOJI = {"spotify": SPOTIFY, "apple": APPLE, "soundcloud": SC}
+SEARCH_CACHE: dict[str, dict] = {}
+CALLBACK_REGISTERED: set[int] = set()
 
 DEFAULT_CFG = {
     "spotify_client_id": "",
@@ -139,16 +144,13 @@ def card(item: dict) -> str:
     return text
 
 
-def result_buttons(results: list[dict]):
+def picker_buttons(key: str, results: list[dict]):
     rows = []
     for i, item in enumerate(results, 1):
-        url = item.get("url")
-        if not url:
-            continue
         emoji = PROVIDER_EMOJI.get(item.get("provider"), MUSIC)
         title = (item.get("title") or "Unknown")[:25]
         artist = (item.get("artist") or "Unknown")[:18]
-        rows.append([Button.url(f"{emoji} {i}. {title} — {artist}", url)])
+        rows.append([Button.inline(f"{emoji} {i}. {title} — {artist}", data=f"ms:{key}:{i - 1}".encode())])
     return rows or None
 
 
@@ -169,40 +171,155 @@ def list_text(query: str, results: list[dict]) -> str:
         artist = html.escape(item.get("artist") or "Unknown")
         provider = html.escape(item.get("provider") or "music")
         lines.append(f"<b>{i}.</b> {emoji} <b>{title}</b> — <code>{artist}</code> <i>({provider})</i>")
-    lines.append("\n🔷 <i>Кнопки ниже открывают найденные треки.</i>")
+    lines.append("\n🔷 <i>Нажми кнопку ниже — выбранный трек отправится в чат.</i>")
     return "\n".join(lines)
 
 
-async def send_inline(event, text: str, *, buttons=None, link_preview=False):
-    """Send via DeathTG inline manager if available, otherwise safe fallback.
+def get_app(event):
+    return getattr(getattr(event, "client", None), "deathtg_app", None)
 
-    Local DeathTG builds may expose different inline helper method names. This
-    function probes them instead of assuming Hikka-style send_or_edit().
-    """
-    app = getattr(getattr(event, "client", None), "deathtg_app", None)
+
+def get_bot_client(event):
+    app = get_app(event)
+    if not app:
+        return None
+    for name in ("bot_client", "bot", "inline_bot", "assistant_bot"):
+        client = getattr(app, name, None)
+        if client:
+            return client
     inline = getattr(app, "inline", None)
-
     if inline:
-        for method_name in ("send_or_edit", "form", "send", "answer"):
+        for name in ("bot_client", "bot", "client"):
+            client = getattr(inline, name, None)
+            if client:
+                return client
+    return None
+
+
+def ensure_callback_handler(client) -> None:
+    if not client:
+        return
+    key = id(client)
+    if key in CALLBACK_REGISTERED:
+        return
+    try:
+        client.add_event_handler(track_callback_handler, events.CallbackQuery(pattern=b"^ms:"))
+        CALLBACK_REGISTERED.add(key)
+    except Exception:
+        pass
+
+
+async def send_picker(event, text: str, results: list[dict]):
+    key = secrets.token_urlsafe(6)
+    SEARCH_CACHE[key] = {"results": results, "time": time.time(), "chat_id": event.chat_id}
+    buttons = picker_buttons(key, results)
+
+    bot_client = get_bot_client(event)
+    ensure_callback_handler(bot_client)
+    ensure_callback_handler(event.client)
+
+    if bot_client:
+        try:
+            sent = await bot_client.send_message(event.chat_id, text, buttons=buttons, parse_mode="html", link_preview=False)
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            return sent
+        except Exception:
+            pass
+
+    app = get_app(event)
+    inline = getattr(app, "inline", None) if app else None
+    if inline:
+        for method_name in ("form", "send", "answer"):
             method = getattr(inline, method_name, None)
             if not method:
                 continue
             try:
                 if method_name == "form":
                     return await method(text, message=event, reply_markup=buttons, ttl=3600)
-                return await method(event, text, buttons=buttons, parse_mode="html", link_preview=link_preview)
-            except TypeError:
-                try:
-                    return await method(event.chat_id, text, buttons=buttons)
-                except Exception:
-                    pass
+                return await method(event, text, buttons=buttons, parse_mode="html", link_preview=False)
             except Exception:
                 pass
 
+    return await event.edit(text, buttons=buttons, parse_mode="html", link_preview=False)
+
+
+async def send_card(event, text: str, *, buttons=None, link_preview=True):
     try:
         return await event.edit(text, buttons=buttons, parse_mode="html", link_preview=link_preview)
     except Exception:
         return await event.respond(text, buttons=buttons, parse_mode="html", link_preview=link_preview)
+
+
+async def download_preview(url: str) -> str | None:
+    if not url or not url.startswith("http"):
+        return None
+    suffix = Path(urlparse(url).path).suffix or ".mp3"
+    if len(suffix) > 8:
+        suffix = ".mp3"
+    fd, path = tempfile.mkstemp(prefix="dtg_music_", suffix=suffix)
+    os.close(fd)
+    try:
+        timeout = aiohttp.ClientTimeout(total=45)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status >= 400:
+                    return None
+                total = 0
+                with open(path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        total += len(chunk)
+                        if total > 12 * 1024 * 1024:
+                            return None
+                        f.write(chunk)
+        return path if os.path.getsize(path) > 0 else None
+    except Exception:
+        return None
+
+
+async def track_callback_handler(event):
+    try:
+        data = (event.data or b"").decode(errors="ignore")
+        _, key, idx_raw = data.split(":", 2)
+        pack = SEARCH_CACHE.get(key)
+        if not pack or time.time() - pack.get("time", 0) > 3600:
+            await event.answer("Поиск устарел, запусти .tr ещё раз", alert=True)
+            return
+        item = pack["results"][int(idx_raw)]
+    except Exception:
+        await event.answer("Не нашёл этот трек в кеше", alert=True)
+        return
+
+    await event.answer("Выбрал трек, готовлю...", alert=False)
+
+    preview = item.get("preview_url") or ""
+    path = await download_preview(preview) if preview and preview != item.get("url") else None
+
+    try:
+        if path:
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            await event.client.send_file(
+                event.chat_id,
+                path,
+                caption=card(item),
+                parse_mode="html",
+                buttons=single_buttons(item),
+                link_preview=True,
+            )
+            return
+
+        await event.edit(card(item), buttons=single_buttons(item), parse_mode="html", link_preview=True)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 async def http_get_json(url: str, headers: dict | None = None):
@@ -336,7 +453,7 @@ def soundcloud_item(x: dict) -> dict:
         "artist": user.get("username") or x.get("publisher_metadata", {}).get("artist") or "Unknown",
         "album": x.get("label_name") or "",
         "url": permalink,
-        "preview_url": permalink,
+        "preview_url": "",
     }
 
 
@@ -362,7 +479,7 @@ async def soundcloud_oembed(url: str):
     if " by " in title:
         left, right = title.rsplit(" by ", 1)
         title, artist = left.strip(), right.strip()
-    return {"provider": "soundcloud", "title": title, "artist": artist, "album": "", "url": url, "preview_url": url}
+    return {"provider": "soundcloud", "title": title, "artist": artist, "album": "", "url": url, "preview_url": ""}
 
 
 async def soundcloud_lookup(url: str):
@@ -411,7 +528,7 @@ async def tr_cmd(event, args: list[str]) -> None:
                 parse_mode="html",
             )
             return
-        await send_inline(event, card(item), buttons=single_buttons(item), link_preview=True)
+        await send_card(event, card(item), buttons=single_buttons(item), link_preview=True)
         return
 
     results = await search_all(query)
@@ -422,7 +539,7 @@ async def tr_cmd(event, args: list[str]) -> None:
         )
         return
 
-    await send_inline(event, list_text(query, results), buttons=result_buttons(results), link_preview=False)
+    await send_picker(event, list_text(query, results), results)
 
 
 @command("trspotify", description="Сохранить Spotify API ключи", usage=".trspotify client_id client_secret")

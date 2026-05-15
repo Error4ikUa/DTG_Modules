@@ -173,6 +173,14 @@ def list_text(query: str, results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def send_inline(event, text: str, *, buttons=None, link_preview=False):
+    app = getattr(getattr(event, "client", None), "deathtg_app", None)
+    inline = getattr(app, "inline", None)
+    if inline:
+        return await inline.send_or_edit(event, text, buttons=buttons, parse_mode="html", link_preview=link_preview)
+    return await event.edit(text, buttons=buttons, parse_mode="html", link_preview=link_preview)
+
+
 async def http_get_json(url: str, headers: dict | None = None):
     timeout = aiohttp.ClientTimeout(total=25)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -379,7 +387,7 @@ async def tr_cmd(event, args: list[str]) -> None:
                 parse_mode="html",
             )
             return
-        await event.edit(card(item), parse_mode="html", buttons=single_buttons(item), link_preview=True)
+        await send_inline(event, card(item), buttons=single_buttons(item), link_preview=True)
         return
 
     results = await search_all(query)
@@ -390,7 +398,7 @@ async def tr_cmd(event, args: list[str]) -> None:
         )
         return
 
-    await event.edit(list_text(query, results), parse_mode="html", buttons=result_buttons(results), link_preview=False)
+    await send_inline(event, list_text(query, results), buttons=result_buttons(results), link_preview=False)
 
 
 @command("trspotify", description="Сохранить Spotify API ключи", usage=".trspotify client_id client_secret")

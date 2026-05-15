@@ -23,12 +23,7 @@ APPLE = "🍎"
 SC = "🟠"
 WARN = "🌀"
 
-
-PROVIDER_EMOJI = {
-    "spotify": SPOTIFY,
-    "apple": APPLE,
-    "soundcloud": SC,
-}
+PROVIDER_EMOJI = {"spotify": SPOTIFY, "apple": APPLE, "soundcloud": SC}
 
 
 class MusicSearchDtgMod(loader.Module):
@@ -72,6 +67,14 @@ class MusicSearchDtgMod(loader.Module):
 
     def save_cfg(self, cfg):
         self.db.set("MusicSearchDtg", "cfg", cfg)
+
+    def raw(self, message, args=None):
+        if args is not None:
+            return str(args or "").strip()
+        try:
+            return utils.get_args_raw(message).strip()
+        except Exception:
+            return ""
 
     def mask(self, value):
         if not value:
@@ -134,7 +137,7 @@ class MusicSearchDtgMod(loader.Module):
         if album:
             text += f"{INFO} <b>Альбом:</b> <code>{album}</code>\n"
         text += f"{MUSIC} <b>Источник:</b> <code>{provider}</code>\n"
-        if preview:
+        if preview and preview != url:
             text += f"{OK} <b>Preview:</b> <code>{preview}</code>\n"
         if url:
             text += f"\n<a href=\"{url}\">🔵 Открыть трек</a>"
@@ -155,7 +158,7 @@ class MusicSearchDtgMod(loader.Module):
         buttons = []
         if item.get("url"):
             buttons.append([{"text": "🔵 Открыть трек", "url": item["url"]}])
-        if item.get("preview_url"):
+        if item.get("preview_url") and item.get("preview_url") != item.get("url"):
             buttons.append([{"text": "🎧 Preview", "url": item["preview_url"]}])
         return buttons or None
 
@@ -192,9 +195,7 @@ class MusicSearchDtgMod(loader.Module):
     async def apple_lookup(self, url):
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
-        track_id = None
-        if qs.get("i"):
-            track_id = qs["i"][0]
+        track_id = qs.get("i", [None])[0]
         if not track_id:
             m = re.search(r"/(\d+)(?:\?|$)", parsed.path)
             if m:
@@ -331,11 +332,7 @@ class MusicSearchDtgMod(loader.Module):
         return await self.soundcloud_oembed(url)
 
     async def search_all(self, query):
-        tasks = [
-            self.apple_search(query, 5),
-            self.spotify_search(query, 5),
-            self.soundcloud_search(query, 5),
-        ]
+        tasks = [self.apple_search(query, 5), self.spotify_search(query, 5), self.soundcloud_search(query, 5)]
         results = []
         for part in await asyncio.gather(*tasks, return_exceptions=True):
             if isinstance(part, list):
@@ -352,9 +349,9 @@ class MusicSearchDtgMod(loader.Module):
             return await self.soundcloud_lookup(url)
         return None
 
-    async def trcmd(self, message):
+    async def trcmd(self, message, args=None):
         """[название/артист/ссылка] — найти трек."""
-        query = utils.get_args_raw(message).strip()
+        query = self.raw(message, args)
         if not query:
             return await utils.answer(message, f"{BLUE} <b>Формат:</b> <code>.tr миражи</code> или <code>.tr ссылка_на_трек</code>")
 
@@ -397,24 +394,23 @@ class MusicSearchDtgMod(loader.Module):
             item = pack["results"][int(index)]
         except Exception:
             return await call.answer("Трек не найден в кеше", show_alert=True)
-        buttons = self.buttons_for_result(item)
-        await call.edit(self.card(item), reply_markup=buttons)
+        await call.edit(self.card(item), reply_markup=self.buttons_for_result(item))
 
-    async def trspotifycmd(self, message):
+    async def trspotifycmd(self, message, args=None):
         """client_id client_secret — сохранить Spotify API ключи."""
-        args = utils.get_args_raw(message).split(maxsplit=1)
+        parts = self.raw(message, args).split(maxsplit=1)
         cfg = self.cfg()
-        if len(args) < 2:
+        if len(parts) < 2:
             return await utils.answer(message, f"{SPOTIFY} <b>Формат:</b> <code>.trspotify client_id client_secret</code>\n{INFO} Создай app в Spotify Developer Dashboard.")
-        cfg["spotify_client_id"] = args[0].strip()
-        cfg["spotify_client_secret"] = args[1].strip()
+        cfg["spotify_client_id"] = parts[0].strip()
+        cfg["spotify_client_secret"] = parts[1].strip()
         self.spotify_cache = {"token": "", "expires": 0}
         self.save_cfg(cfg)
         await utils.answer(message, f"{OK} <b>Spotify ключи сохранены.</b>")
 
-    async def trsoundcloudcmd(self, message):
+    async def trsoundcloudcmd(self, message, args=None):
         """token — сохранить SoundCloud API token."""
-        token = utils.get_args_raw(message).strip()
+        token = self.raw(message, args)
         cfg = self.cfg()
         if not token:
             return await utils.answer(message, f"{SC} <b>Формат:</b> <code>.trsoundcloud token</code>\n{INFO} Нужен SoundCloud API/OAuth token. Без него ссылки SoundCloud частично работают через oEmbed, но поиск может не работать.")
@@ -422,7 +418,7 @@ class MusicSearchDtgMod(loader.Module):
         self.save_cfg(cfg)
         await utils.answer(message, f"{OK} <b>SoundCloud token сохранён.</b>")
 
-    async def trstatuscmd(self, message):
+    async def trstatuscmd(self, message, args=None):
         """— статус ключей MusicSearchDtg."""
         cfg = self.cfg()
         await utils.answer(

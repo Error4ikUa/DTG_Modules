@@ -1,317 +1,451 @@
 # meta developer: @DeathTerror
 # meta name: MusicSearchDtg
-# meta description: SoundCloud-only music search with DeathTG inline buttons.
+# meta description: SoundCloud, TikTok and YouTube downloader for DeathTG with native inline buttons.
 # meta category: media
-# meta version: 2.0.0
+# meta version: 2.2.0
 # meta author: DeathTerror
-# requires: aiohttp
+# requires: requests yt-dlp
+
+from __future__ import annotations
 
 import asyncio
-import io
+import html
 import logging
+import os
 import re
-from typing import Dict, List, Optional, Tuple, Union
-from urllib.parse import parse_qs
-from urllib.parse import urlsplit as E
+import tempfile
+import time
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlsplit
 
 import requests
-from PIL import Image
-from telethon.tl.types import Message
 from yt_dlp import YoutubeDL
 
-from .. import loader, utils
+from deathtg.loader import Module
+from deathtg.command import command
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("deathtg.modules.MusicSearchDtg")
 
-_SC_API = "https://api-v2.soundcloud.com"
-_CLIENT_ID = "iZ0gA7dgGx7v1N077p276V046g7uN67p"  
+SC_API = "https://api-v2.soundcloud.com"
+SC_CLIENT_ID = "iZ0gA7dgGx7v1N077p276V046g7uN67p"
 
 YTDL_OPTS_BASE = {
     "quiet": True,
     "no_warnings": True,
     "nocheckcertificate": True,
+    "restrictfilenames": False,
 }
 
 
-class MediaDownloaderMod(loader.Module):
-    """Модуль для скачивания медиа: SoundCloud (.tr), TikTok (.tt) и YouTube (.yt)"""
+class MusicSearchDtgMod(Module):
+    """Media downloader for DeathTG: SoundCloud (.tr), TikTok (.tt), YouTube (.yt)."""
 
     strings = {
-        "name": "MediaDownloader",
-        "description": "Скачивание музыки и видео из SoundCloud, TikTok и YouTube",
-        "no_args": "<emoji document_id=5778527486270770928>❌</emoji> <b>Введите название или ссылку!</b>",
-        "loading": "<emoji document_id=5841359499146825803>⏳</emoji> <b>Загрузка...</b>",
-        "searching": "<emoji document_id=5841359499146825803>🔍</emoji> <b>Поиск треков в SoundCloud...</b>",
-        "sc_select": "<emoji document_id=6007938409857815902>🎧</emoji> <b>Выберите нужный трек из SoundCloud:</b>",
-        "downloading": "<emoji document_id=5841359499146825803>📥</emoji> <b>Скачивание файла...</b>",
-        "error": "<emoji document_id=5778527486270770928>❌</emoji> <b>Ошибка:</b> <code>{}</code>",
-        "bad_url": "<emoji document_id=5778527486270770928>❌</emoji> <b>Неподдерживаемая ссылка.</b>",
+        "name": "MusicSearchDtg",
+        "title": "MusicSearchDtg",
+        "description": "Download media from SoundCloud, TikTok and YouTube with native inline buttons.",
+        "category": "media",
+        "version": "2.2.0",
+        "author": "DeathTerror",
+        "commands": ".tr, .tt, .yt",
+        "usage": ".tr query/link | .tt tiktok_link | .yt youtube_link",
+        "permissions": "owner",
     }
 
-    strings_ru = {
-        "no_args": "<emoji document_id=5778527486270770928>❌</emoji> <b>Введите название или ссылку!</b>",
-        "loading": "<emoji document_id=5841359499146825803>⏳</emoji> <b>Загрузка...</b>",
-        "searching": "<emoji document_id=5841359499146825803>🔍</emoji> <b>Поиск треков в SoundCloud...</b>",
-        "sc_select": "<emoji document_id=6007938409857815902>🎧</emoji> <b>Выберите нужный трек из SoundCloud:</b>",
-        "downloading": "<emoji document_id=5841359499146825803>📥</emoji> <b>Скачивание файла...</b>",
-        "error": "<emoji document_id=5778527486270770928>❌</emoji> <b>Ошибка:</b> <code>{}</code>",
-        "bad_url": "<emoji document_id=5778527486270770928>❌</emoji> <b>Неподдерживаемая ссылка.</b>",
+    STOP_WORDS = {
+        "the", "a", "an", "and", "or", "feat", "ft", "prod", "official",
+        "audio", "video", "lyrics", "lyric", "remix", "slowed", "reverb",
     }
 
-    def __init__(self):
-        self.config = loader.ModuleConfig(
-            loader.ConfigValue(
-                "sc_client_id",
-                _CLIENT_ID,
-                "SoundCloud Public Client ID (если перестанет искать, обновите)",
-                validator=loader.validators.String(),
-            )
-        )
-        self._sc_cache: Dict[str, List[dict]] = {}
+    def __init__(self) -> None:
+        super().__init__()
+        self.sc_cache: Dict[str, List[dict]] = {}
+        self.sc_client_id = SC_CLIENT_ID
 
-    async def client_ready(self, client, db):
-        self.client = client
+    # -------------------- helpers --------------------
 
-    # ==========================================
-    #             SOUNDCLOUD (.tr)
-    # ==========================================
+    @staticmethod
+    def args_text(args) -> str:
+        if isinstance(args, (list, tuple)):
+            return " ".join(str(item) for item in args).strip()
+        return str(args or "").strip()
 
-    @loader.command(
-        ru_doc="[ссылка/название] — Скачать трек из SoundCloud. Если указано название, выдаст 3 варианта.",
-        en_doc="[link/query] — Download track from SoundCloud. Gives 3 options if queried by name.",
-    )
-    async def trcmd(self, message: Message):
-        args = utils.get_args_raw(message) or await self._get_reply_text(message)
-        if not args:
-            return await utils.answer(message, self.strings("no_args"))
+    @staticmethod
+    def esc(text: object) -> str:
+        return html.escape(str(text or ""), quote=False)
 
-        if "soundcloud.com" in args:
-            await utils.answer(message, self.strings("downloading"))
-            await self._download_and_send_sc(message, args)
-        else:
-            await utils.answer(message, self.strings("searching"))
-            tracks = await self._search_sc(args)
-            if not tracks:
-                return await utils.answer(message, self.strings("error").format("Ничего не найдено"))
+    @staticmethod
+    def is_url(text: str) -> bool:
+        return bool(re.match(r"https?://", text or "", re.I))
 
-            msg_id = f"{message.chat_id}_{message.id}"
-            self._sc_cache[msg_id] = tracks
+    @staticmethod
+    def normalize(text: str) -> str:
+        text = str(text or "").lower().replace("ё", "е")
+        text = re.sub(r"[\[\](){}]+", " ", text)
+        text = re.sub(r"[^a-zа-яіїєґ0-9\s]+", " ", text, flags=re.I)
+        return re.sub(r"\s+", " ", text).strip()
 
-            buttons = []
-            for idx, track in enumerate(tracks):
-                title = track.get("title", "Unknown Track")[:30]
-                artist = track.get("user", {}).get("username", "Unknown Artist")[:15]
-                buttons.append(
-                    [
-                        {
-                            "text": f"🎵 {artist} - {title}",
-                            "callback": self._sc_callback,
-                            "args": (msg_id, idx),
-                        }
-                    ]
-                )
+    def tokens(self, text: str) -> List[str]:
+        return [item for item in self.normalize(text).split() if len(item) > 1 and item not in self.STOP_WORDS]
 
-            await self.inline.form(
-                message=message,
-                text=self.strings("sc_select"),
-                reply_markup=buttons,
-            )
+    @staticmethod
+    def safe_file_name(name: str) -> str:
+        name = re.sub(r"[^a-zA-Zа-яА-ЯёЁіїєґІЇЄҐ0-9 ._\-]+", "", str(name or "media")).strip()
+        name = re.sub(r"\s+", " ", name)
+        return (name or "media")[:90]
 
-    async def _search_sc(self, query: str) -> List[dict]:
-        def sync_search():
+    @staticmethod
+    def cleanup_file(path: str | Path | None) -> None:
+        if not path:
+            return
+        try:
+            path_obj = Path(path)
+            if path_obj.exists() and path_obj.is_file():
+                path_obj.unlink()
+        except Exception:
+            pass
+
+    async def reply_text(self, event) -> Optional[str]:
+        try:
+            reply = await event.get_reply_message()
+            if reply and getattr(reply, "raw_text", None):
+                return reply.raw_text.strip()
+        except Exception:
+            return None
+        return None
+
+    async def set_status(self, event, text: str):
+        try:
+            return await event.edit(text, parse_mode="html")
+        except Exception:
+            return await event.respond(text, parse_mode="html")
+
+    def result_score(self, query: str, item: dict) -> float:
+        query_norm = self.normalize(query)
+        title = self.normalize(item.get("title", ""))
+        artist = self.normalize((item.get("user") or {}).get("username", ""))
+        combined = self.normalize(f"{title} {artist}")
+        query_tokens = set(self.tokens(query))
+        combined_tokens = set(self.tokens(combined))
+        if not query_tokens or not combined_tokens:
+            return 0.0
+        coverage = len(query_tokens & combined_tokens) / max(1, len(query_tokens))
+        precision = len(query_tokens & combined_tokens) / max(1, len(combined_tokens))
+        seq = SequenceMatcher(None, query_norm, combined).ratio()
+        title_seq = SequenceMatcher(None, query_norm, title).ratio()
+        bonus = 0.0
+        if query_norm and query_norm in combined:
+            bonus += 0.35
+        if query_tokens <= combined_tokens:
+            bonus += 0.22
+        return coverage * 0.50 + precision * 0.18 + seq * 0.18 + title_seq * 0.14 + bonus
+
+    def query_variants(self, query: str) -> List[str]:
+        clean = self.normalize(query)
+        tokens = self.tokens(query)
+        variants = [query.strip(), clean]
+        if " - " in query:
+            left, right = query.split(" - ", 1)
+            variants.extend([f"{left} {right}", f"{right} {left}", left, right])
+        if len(tokens) >= 2:
+            variants.append(" ".join(tokens))
+        if len(tokens) >= 3:
+            variants.append(" ".join(tokens[:3]))
+            variants.append(" ".join(tokens[-3:]))
+        result = []
+        seen = set()
+        for item in variants:
+            item = " ".join(str(item or "").split()).strip()
+            key = item.lower()
+            if item and key not in seen:
+                seen.add(key)
+                result.append(item)
+        return result[:6]
+
+    # -------------------- SoundCloud search UI --------------------
+
+    def soundcloud_text(self, query: str, tracks: List[dict]) -> str:
+        lines = [f"<b>SoundCloud:</b> <code>{self.esc(query)}</code>", ""]
+        for index, track in enumerate(tracks, 1):
+            title = self.esc(track.get("title", "Unknown"))
+            artist = self.esc((track.get("user") or {}).get("username", "Unknown"))
+            score = float(track.get("score", 0))
+            lines.append(f"<b>{index}.</b> <b>{title}</b> — <code>{artist}</code> <i>({score:.2f})</i>")
+        lines += ["", "Choose track below."]
+        return "\n".join(lines)
+
+    def soundcloud_buttons(self, key: str, tracks: List[dict]):
+        rows = []
+        for index, track in enumerate(tracks, 1):
+            title = str(track.get("title", "Unknown"))[:30]
+            artist = str((track.get("user") or {}).get("username", "Unknown"))[:18]
+            rows.append([
+                {
+                    "text": f"{index}. {artist} - {title}",
+                    "callback": self.sc_callback,
+                    "args": (key, index - 1),
+                }
+            ])
+        rows.append([{"text": "Close", "callback": self.close_callback, "args": ()}])
+        return self.inline_buttons(*rows)
+
+    # -------------------- SoundCloud --------------------
+
+    async def search_sc_raw(self, query: str, limit: int = 20) -> List[dict]:
+        def sync_search() -> List[dict]:
             try:
-                r = requests.get(
-                    f"{_SC_API}/tracks",
-                    params={
-                        "q": query,
-                        "client_id": self.config["sc_client_id"],
-                        "limit": 3,
-                    },
-                    timeout=10,
+                response = requests.get(
+                    f"{SC_API}/tracks",
+                    params={"q": query, "client_id": self.sc_client_id, "limit": limit},
+                    timeout=15,
                 )
-                if r.status_code == 200:
-                    return r.json().get("collection", [])
-            except Exception as e:
-                logger.error(f"SC Search error: {e}")
+                if response.status_code == 200:
+                    data = response.json()
+                    if isinstance(data, dict):
+                        return data.get("collection", []) or []
+            except Exception as exc:
+                logger.warning("SoundCloud search failed: %s", exc)
             return []
 
-        return await utils.run_sync(sync_search)
+        return await asyncio.to_thread(sync_search)
 
-    async def _sc_callback(self, call):
-        msg_id, idx = call.args
-        tracks = self._sc_cache.get(msg_id)
+    async def search_sc(self, query: str, limit: int = 3) -> List[dict]:
+        tracks: List[dict] = []
+        seen = set()
+        for variant in self.query_variants(query):
+            for track in await self.search_sc_raw(variant, 20):
+                url = track.get("permalink_url") or track.get("uri") or f"{track.get('title')}:{track.get('id')}"
+                if url in seen:
+                    continue
+                seen.add(url)
+                track["score"] = self.result_score(query, track)
+                tracks.append(track)
+        tracks.sort(key=lambda item: item.get("score", 0), reverse=True)
+        return tracks[:limit]
 
-        if not tracks or idx >= len(tracks):
-            return await call.answer("Сессия истекла или трек не найден", alert=True)
+    async def download_sc(self, url: str) -> Tuple[str, dict]:
+        workdir = tempfile.mkdtemp(prefix="dtg_sc_")
+        opts = {
+            **YTDL_OPTS_BASE,
+            "format": "bestaudio/best",
+            "outtmpl": str(Path(workdir) / "%(uploader)s - %(title)s.%(ext)s"),
+        }
 
-        track_url = tracks[idx].get("permalink_url")
-        await call.edit(self.strings("downloading"))
+        def download() -> Tuple[str, dict]:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                file_name = ydl.prepare_filename(info)
+                return file_name, info
 
-        await self._download_and_send_sc(call.message, track_url, is_callback=True)
+        return await asyncio.to_thread(download)
 
-    async def _download_and_send_sc(self, message: Message, url: str, is_callback: bool = False):
+    async def send_sc(self, client, chat_id, url: str) -> bool:
+        file_name = None
         try:
-            opts = {
-                **YTDL_OPTS_BASE,
-                "format": "bestaudio/best",
-                "outtmpl": "%(title)s.%(ext)s",
-            }
-
-            def download():
-                with YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    filename = ydl.prepare_filename(info)
-                    return filename, info
-
-            filename, info = await utils.run_sync(download)
-
-            with open(filename, "rb") as f:
-                audio_data = io.BytesIO(f.read())
-            audio_data.name = filename
-
+            file_name, info = await self.download_sc(url)
             title = info.get("title", "Track")
             artist = info.get("uploader", "SoundCloud")
-
-            await self.client.send_file(
-                message.chat_id,
-                file=audio_data,
-                voice=False,
-                attributes=[],
-                caption=f"⚡ <b>{artist} — {title}</b>",
+            await client.send_file(
+                chat_id,
+                file=file_name,
+                caption=f"<b>{self.esc(artist)} — {self.esc(title)}</b>",
+                parse_mode="html",
+                force_document=False,
             )
-
-            if is_callback:
-                await message.delete()
-            else:
-                await message.delete()
-
-            import os
-            if os.path.exists(filename):
-                os.remove(filename)
-
-        except Exception as e:
-            logger.exception("SC Download failed")
-            await utils.answer(message, self.strings("error").format(str(e)))
-
-    # ==========================================
-    #               TIKTOK (.tt)
-    # ==========================================
-
-    @loader.command(
-        ru_doc="[ссылка] — Скачать видео из TikTok без водяного знака.",
-        en_doc="[link] — Download TikTok video without watermark.",
-    )
-    async def ttcmd(self, message: Message):
-        url = utils.get_args_raw(message) or await self._get_reply_text(message)
-        if not url:
-            return await utils.answer(message, self.strings("no_args"))
-
-        if "tiktok.com" not in url:
-            return await utils.answer(message, self.strings("bad_url"))
-
-        await utils.answer(message, self.strings("loading"))
-        video_url, api_res = await self._parse_tt(url)
-
-        if not video_url:
+            return True
+        except Exception as exc:
+            logger.exception("SoundCloud download failed: %s", exc)
+            return False
+        finally:
+            self.cleanup_file(file_name)
             try:
-                await utils.answer(message, self.strings("downloading"))
-                bytes_data = await utils.run_sync(lambda: requests.get(api_res).content)
-                video_io = io.BytesIO(bytes_data)
-                video_io.name = "tiktok.mp4"
-                await self.client.send_file(message.chat_id, file=video_io)
-                return await message.delete()
+                parent = Path(file_name).parent if file_name else None
+                if parent and parent.exists() and parent.name.startswith("dtg_sc_"):
+                    parent.rmdir()
             except Exception:
-                return await utils.answer(message, self.strings("error").format("Не удалось извлечь видео"))
+                pass
 
-        try:
-            await utils.answer(message, self.strings("downloading"))
-            bytes_data = await utils.run_sync(lambda: requests.get(video_url).content)
-            video_io = io.BytesIO(bytes_data)
-            video_io.name = "tiktok.mp4"
+    @command("tr", description="Download SoundCloud track", usage=".tr link_or_query")
+    async def tr_cmd(self, event, args):
+        query = self.args_text(args) or await self.reply_text(event)
+        if not query:
+            await self.set_status(event, "<b>Usage:</b> <code>.tr soundcloud link or track name</code>")
+            return
 
-            await self.client.send_file(message.chat_id, file=video_io)
-            await message.delete()
-        except Exception as e:
-            await utils.answer(message, self.strings("error").format(str(e)))
-
-    async def _parse_tt(self, url: str) -> Tuple[Union[str, bool], str]:
-        def sync_tt():
-            try:
-                actual_url = requests.head(url, allow_redirects=True).url
+        if "soundcloud.com" in query:
+            await self.set_status(event, "<b>Downloading SoundCloud track...</b>")
+            ok = await self.send_sc(event.client, event.chat_id, query)
+            if ok:
                 try:
-                    query = parse_qs(E(actual_url).query)
-                    item_id = query.get("share_item_id")[0]
+                    await event.delete()
                 except Exception:
-                    item_id = "".join(re.findall("[0-9]", E(actual_url).path.split("/")[-1]))
+                    pass
+            else:
+                await self.set_status(event, "<b>SoundCloud download failed.</b>")
+            return
 
-                api_url = f"https://api-va.tiktokv.com/aweme/v1/multi/aweme/detail/?aweme_ids=%5B{item_id}%5D"
-                res = requests.get(api_url).json()
-                details = res.get("aweme_details")
-                if not details:
-                    return False, api_url
-                return details[0]["video"]["bit_rate"][0]["play_addr"]["url_list"][-1], api_url
-            except Exception:
-                return False, url
+        await self.set_status(event, "<b>Searching SoundCloud...</b>")
+        tracks = await self.search_sc(query, 3)
+        if not tracks:
+            await self.set_status(event, "<b>Nothing found.</b>")
+            return
 
-        return await utils.run_sync(sync_tt)
+        key = f"sc_{int(time.time())}_{id(event)}"
+        self.sc_cache[key] = tracks
+        await self.inline_send(
+            event,
+            self.soundcloud_text(query, tracks),
+            reply_markup=self.soundcloud_buttons(key, tracks),
+            parse_mode="html",
+            link_preview=False,
+            ttl=3600,
+        )
 
-    # ==========================================
-    #               YOUTUBE (.yt)
-    # ==========================================
-
-    @loader.command(
-        ru_doc="[ссылка] — Скачать видео с YouTube в качестве до 1080p MP4.",
-        en_doc="[link] — Download YouTube video in quality up to 1080p MP4.",
-    )
-    async def ytcmd(self, message: Message):
-        url = utils.get_args_raw(message) or await self._get_reply_text(message)
+    async def sc_callback(self, call, key: str, index: int):
+        tracks = self.sc_cache.get(key)
+        if not tracks or index >= len(tracks):
+            await call.edit("Session expired.", reply_markup=None)
+            return
+        url = tracks[index].get("permalink_url")
         if not url:
-            return await utils.answer(message, self.strings("no_args"))
+            await call.edit("Track URL not found.", reply_markup=None)
+            return
+        await call.edit("<b>Downloading...</b>", reply_markup=None, parse_mode="html")
+        client = getattr(call, "original_client", None)
+        chat_id = getattr(call, "original_chat_id", None)
+        if client and chat_id and await self.send_sc(client, chat_id, url):
+            await call.edit("Done.", reply_markup=None)
+        else:
+            await call.edit("Download failed.", reply_markup=None)
 
-        if "youtube.com" not in url and "youtu.be" not in url:
-            return await utils.answer(message, self.strings("bad_url"))
+    # -------------------- TikTok --------------------
 
-        await utils.answer(message, self.strings("downloading"))
+    @command("tt", description="Download TikTok video", usage=".tt tiktok_link")
+    async def tt_cmd(self, event, args):
+        url = self.args_text(args) or await self.reply_text(event)
+        if not url:
+            await self.set_status(event, "<b>Usage:</b> <code>.tt tiktok link</code>")
+            return
+        if "tiktok.com" not in url:
+            await self.set_status(event, "<b>Unsupported TikTok link.</b>")
+            return
+        await self.set_status(event, "<b>Downloading TikTok...</b>")
+        ok = await self.send_tiktok(event.client, event.chat_id, url)
+        if ok:
+            try:
+                await event.delete()
+            except Exception:
+                pass
+        else:
+            await self.set_status(event, "<b>TikTok download failed.</b>")
 
+    async def parse_tiktok(self, url: str) -> Tuple[Optional[str], str]:
+        def sync_parse() -> Tuple[Optional[str], str]:
+            try:
+                actual_url = requests.head(url, allow_redirects=True, timeout=15).url
+                try:
+                    query = parse_qs(urlsplit(actual_url).query)
+                    item_id = query.get("share_item_id", [""])[0]
+                except Exception:
+                    item_id = "".join(re.findall("[0-9]", urlsplit(actual_url).path.split("/")[-1]))
+                api_url = f"https://api-va.tiktokv.com/aweme/v1/multi/aweme/detail/?aweme_ids=%5B{item_id}%5D"
+                result = requests.get(api_url, timeout=15).json()
+                details = result.get("aweme_details") or []
+                if not details:
+                    return None, api_url
+                video = details[0].get("video") or {}
+                rates = video.get("bit_rate") or []
+                if rates:
+                    urls = rates[0].get("play_addr", {}).get("url_list") or []
+                    if urls:
+                        return urls[-1], api_url
+            except Exception as exc:
+                logger.warning("TikTok parse failed: %s", exc)
+            return None, url
+
+        return await asyncio.to_thread(sync_parse)
+
+    async def send_tiktok(self, client, chat_id, url: str) -> bool:
+        file_path = None
         try:
+            video_url, fallback_url = await self.parse_tiktok(url)
+            target_url = video_url or fallback_url
+
+            def download() -> str:
+                response = requests.get(target_url, timeout=60)
+                response.raise_for_status()
+                path = Path(tempfile.gettempdir()) / f"dtg_tiktok_{int(time.time())}.mp4"
+                path.write_bytes(response.content)
+                return str(path)
+
+            file_path = await asyncio.to_thread(download)
+            await client.send_file(chat_id, file=file_path, supports_streaming=True)
+            return True
+        except Exception as exc:
+            logger.exception("TikTok download failed: %s", exc)
+            return False
+        finally:
+            self.cleanup_file(file_path)
+
+    # -------------------- YouTube --------------------
+
+    @command("yt", description="Download YouTube video", usage=".yt youtube_link")
+    async def yt_cmd(self, event, args):
+        url = self.args_text(args) or await self.reply_text(event)
+        if not url:
+            await self.set_status(event, "<b>Usage:</b> <code>.yt youtube link</code>")
+            return
+        if "youtube.com" not in url and "youtu.be" not in url:
+            await self.set_status(event, "<b>Unsupported YouTube link.</b>")
+            return
+        await self.set_status(event, "<b>Downloading YouTube...</b>")
+        ok = await self.send_youtube(event.client, event.chat_id, url)
+        if ok:
+            try:
+                await event.delete()
+            except Exception:
+                pass
+        else:
+            await self.set_status(event, "<b>YouTube download failed.</b>")
+
+    async def send_youtube(self, client, chat_id, url: str) -> bool:
+        file_name = None
+        try:
+            workdir = tempfile.mkdtemp(prefix="dtg_yt_")
             opts = {
                 **YTDL_OPTS_BASE,
                 "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
-                "outtmpl": "yt_video_%(id)s.%(ext)s",
+                "outtmpl": str(Path(workdir) / "yt_%(id)s.%(ext)s"),
                 "merge_output_format": "mp4",
             }
 
-            def download_yt():
+            def download() -> Tuple[str, dict]:
                 with YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     return ydl.prepare_filename(info), info
 
-            filename, info = await utils.run_sync(download_yt)
-
-            await utils.answer(message, f"📤 <b>Отправка видео:</b> {info.get('title', 'YouTube Video')}")
-            
-            await self.client.send_file(
-                message.chat_id,
-                file=filename,
-                caption=f"🎬 <b>{info.get('title')}</b>",
+            file_name, info = await asyncio.to_thread(download)
+            await client.send_file(
+                chat_id,
+                file=file_name,
+                caption=f"<b>{self.esc(info.get('title', 'YouTube Video'))}</b>",
+                parse_mode="html",
                 supports_streaming=True,
             )
-            
-            await message.delete()
-            import os
-            if os.path.exists(filename):
-                os.remove(filename)
+            return True
+        except Exception as exc:
+            logger.exception("YouTube download failed: %s", exc)
+            return False
+        finally:
+            self.cleanup_file(file_name)
+            try:
+                parent = Path(file_name).parent if file_name else None
+                if parent and parent.exists() and parent.name.startswith("dtg_yt_"):
+                    parent.rmdir()
+            except Exception:
+                pass
 
-        except Exception as e:
-            logger.exception("YouTube Download failed")
-            await utils.answer(message, self.strings("error").format(str(e)))
-
-    # ==========================================
-    #             УТИЛИТЫ МОДУЛЯ
-    # ==========================================
-
-    async def _get_reply_text(self, message: Message) -> Optional[str]:
-        reply = await message.get_reply_message()
-        if reply and reply.raw_text:
-            return reply.raw_text.strip()
-        return None
+    async def close_callback(self, call):
+        await call.edit("Closed.", reply_markup=None)

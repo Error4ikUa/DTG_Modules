@@ -2,7 +2,7 @@
 # meta name: DownloaderDtg
 # meta description: SoundCloud, TikTok and YouTube downloader for DeathTG with native inline buttons.
 # meta category: media
-# meta version: 2.3.0
+# meta version: 2.3.1
 # meta author: DeathTerror
 # requires: yt-dlp
 
@@ -46,7 +46,7 @@ class DownloaderDtgMod(Module):
         "title": "DownloaderDtg",
         "description": "Download media from SoundCloud, TikTok and YouTube with native inline buttons.",
         "category": "media",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "author": "DeathTerror",
         "commands": ".tr, .tt, .yt",
         "usage": ".tr query/link | .tt tiktok_link | .yt youtube_link",
@@ -115,8 +115,6 @@ class DownloaderDtgMod(Module):
             return filepath
         return ydl.prepare_filename(info)
 
-    # -------------------- yt-dlp core --------------------
-
     async def ytdlp_extract(self, target: str, opts: dict, download: bool = False) -> dict | None:
         def run() -> dict | None:
             with YoutubeDL({**YTDL_BASE, **opts}) as ydl:
@@ -135,7 +133,6 @@ class DownloaderDtgMod(Module):
                 "outtmpl": str(Path(workdir) / "%(uploader|Unknown)s - %(title|Track)s.%(ext)s"),
             }
         else:
-            # One-file format first, so YouTube does not require ffmpeg merge.
             opts = {
                 "format": "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best",
                 "outtmpl": str(Path(workdir) / "%(title|video)s.%(ext)s"),
@@ -146,27 +143,30 @@ class DownloaderDtgMod(Module):
         file_path = self.prepared_path(YoutubeDL({**YTDL_BASE, **opts}), info)
         if file_path and Path(file_path).exists():
             return file_path, info
-        # yt-dlp may change extension after download; find newest file in workdir.
         files = [p for p in Path(workdir).glob("*") if p.is_file()]
         if files:
             newest = max(files, key=lambda p: p.stat().st_mtime)
             return str(newest), info
         return None, info
 
-    async def send_downloaded(self, client, chat_id, url: str, media_type: str) -> bool:
+    async def send_downloaded(self, client, chat_id, url: str, media_type: str, with_caption: bool = True) -> bool:
         file_path = None
         try:
             file_path, info = await self.ytdlp_download(url, media_type)
             if not file_path:
                 return False
-            title = self.esc((info or {}).get("title") or "Media")
-            uploader = self.esc((info or {}).get("uploader") or (info or {}).get("channel") or "")
-            caption = f"<b>{title}</b>" if not uploader else f"<b>{uploader} - {title}</b>"
+
+            caption = ""
+            if with_caption:
+                title = self.esc((info or {}).get("title") or "Media")
+                uploader = self.esc((info or {}).get("uploader") or (info or {}).get("channel") or "")
+                caption = f"<b>{title}</b>" if not uploader else f"<b>{uploader} - {title}</b>"
+
             await client.send_file(
                 chat_id,
                 file=file_path,
                 caption=caption,
-                parse_mode="html",
+                parse_mode="html" if caption else None,
                 force_document=False,
                 supports_streaming=(media_type == "video"),
             )
@@ -176,8 +176,6 @@ class DownloaderDtgMod(Module):
             return False
         finally:
             self.cleanup_path(file_path)
-
-    # -------------------- SoundCloud search --------------------
 
     async def search_sc(self, query: str, limit: int = 3) -> List[dict]:
         target = query if self.is_url(query) else f"scsearch{limit}:{query}"
@@ -275,8 +273,6 @@ class DownloaderDtgMod(Module):
         else:
             await call.edit("Download failed.", reply_markup=None)
 
-    # -------------------- TikTok / YouTube --------------------
-
     @command("tt", description="Download TikTok video", usage=".tt tiktok_link")
     async def tt_cmd(self, event, args):
         url = self.args_text(args) or await self.reply_text(event)
@@ -287,7 +283,7 @@ class DownloaderDtgMod(Module):
             await self.set_status(event, "<b>Unsupported TikTok link.</b>")
             return
         await self.set_status(event, "<b>Downloading TikTok...</b>")
-        ok = await self.send_downloaded(event.client, event.chat_id, url, "video")
+        ok = await self.send_downloaded(event.client, event.chat_id, url, "video", with_caption=False)
         if ok:
             try:
                 await event.delete()

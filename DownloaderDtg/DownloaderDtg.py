@@ -2,24 +2,27 @@
 # meta name: DownloaderDtg
 # meta description: SoundCloud, TikTok and YouTube downloader for DeathTG with native inline buttons.
 # meta category: media
-# meta version: 2.2.0
+# meta version: 2.2.1
 # meta author: DeathTerror
-# requires: requests yt-dlp
+# requires: yt-dlp
 
 from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import re
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
-import requests
 from yt_dlp import YoutubeDL
 
 from deathtg.loader import Module
@@ -46,7 +49,7 @@ class DownloaderDtgMod(Module):
         "title": "DownloaderDtg",
         "description": "Download media from SoundCloud, TikTok and YouTube with native inline buttons.",
         "category": "media",
-        "version": "2.2.0",
+        "version": "2.2.1",
         "author": "DeathTerror",
         "commands": ".tr, .tt, .yt",
         "usage": ".tr query/link | .tt tiktok_link | .yt youtube_link",
@@ -62,6 +65,34 @@ class DownloaderDtgMod(Module):
         super().__init__()
         self.sc_cache: Dict[str, List[dict]] = {}
         self.sc_client_id = SC_CLIENT_ID
+
+    # -------------------- stdlib HTTP --------------------
+
+    @staticmethod
+    def http_headers() -> dict:
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            "Accept": "application/json,text/html,*/*",
+        }
+
+    def http_get_bytes(self, url: str, timeout: int = 30) -> bytes:
+        request = urllib.request.Request(url, headers=self.http_headers())
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+
+    def http_get_json(self, url: str, params: Optional[dict] = None, timeout: int = 30) -> dict:
+        if params:
+            url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        raw = self.http_get_bytes(url, timeout=timeout)
+        return json.loads(raw.decode("utf-8", errors="replace"))
+
+    def http_head_url(self, url: str, timeout: int = 20) -> str:
+        request = urllib.request.Request(url, headers=self.http_headers(), method="HEAD")
+        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
+        with opener.open(request, timeout=timeout) as response:
+            return response.geturl()
+
+    # -------------------- helpers --------------------
 
     @staticmethod
     def args_text(args) -> str:
@@ -151,6 +182,8 @@ class DownloaderDtgMod(Module):
                 result.append(item)
         return result[:6]
 
+    # -------------------- SoundCloud UI/search --------------------
+
     def soundcloud_text(self, query: str, tracks: List[dict]) -> str:
         lines = [f"<b>SoundCloud:</b> <code>{self.esc(query)}</code>", ""]
         for index, track in enumerate(tracks, 1):
@@ -175,15 +208,13 @@ class DownloaderDtgMod(Module):
     async def search_sc_raw(self, query: str, limit: int = 20) -> List[dict]:
         def sync_search() -> List[dict]:
             try:
-                response = requests.get(
+                data = self.http_get_json(
                     f"{SC_API}/tracks",
                     params={"q": query, "client_id": self.sc_client_id, "limit": limit},
                     timeout=15,
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    if isinstance(data, dict):
-                        return data.get("collection", []) or []
+                if isinstance(data, dict):
+                    return data.get("collection", []) or []
             except Exception as exc:
                 logger.warning("SoundCloud search failed: %s", exc)
             return []
@@ -281,6 +312,8 @@ class DownloaderDtgMod(Module):
         else:
             await call.edit("Download failed.", reply_markup=None)
 
+    # -------------------- TikTok --------------------
+
     @command("tt", description="Download TikTok video", usage=".tt tiktok_link")
     async def tt_cmd(self, event, args):
         url = self.args_text(args) or await self.reply_text(event)
@@ -303,14 +336,14 @@ class DownloaderDtgMod(Module):
     async def parse_tiktok(self, url: str) -> Tuple[Optional[str], str]:
         def sync_parse() -> Tuple[Optional[str], str]:
             try:
-                actual_url = requests.head(url, allow_redirects=True, timeout=15).url
+                actual_url = self.http_head_url(url, timeout=15)
                 try:
                     query = parse_qs(urlsplit(actual_url).query)
                     item_id = query.get("share_item_id", [""])[0]
                 except Exception:
                     item_id = "".join(re.findall("[0-9]", urlsplit(actual_url).path.split("/")[-1]))
                 api_url = f"https://api-va.tiktokv.com/aweme/v1/multi/aweme/detail/?aweme_ids=%5B{item_id}%5D"
-                result = requests.get(api_url, timeout=15).json()
+                result = self.http_get_json(api_url, timeout=15)
                 details = result.get("aweme_details") or []
                 if not details:
                     return None, api_url
@@ -333,10 +366,9 @@ class DownloaderDtgMod(Module):
             target_url = video_url or fallback_url
 
             def download() -> str:
-                response = requests.get(target_url, timeout=60)
-                response.raise_for_status()
+                data = self.http_get_bytes(target_url, timeout=60)
                 path = Path(tempfile.gettempdir()) / f"dtg_tiktok_{int(time.time())}.mp4"
-                path.write_bytes(response.content)
+                path.write_bytes(data)
                 return str(path)
 
             file_path = await asyncio.to_thread(download)
@@ -347,6 +379,8 @@ class DownloaderDtgMod(Module):
             return False
         finally:
             self.cleanup_file(file_path)
+
+    # -------------------- YouTube --------------------
 
     @command("yt", description="Download YouTube video", usage=".yt youtube_link")
     async def yt_cmd(self, event, args):

@@ -2,7 +2,7 @@
 # meta name: AutoProfile
 # meta description: Telegram profile automation: avatar rotate, photo set/delete, bio text and premium emoji status.
 # meta category: profile
-# meta version: 1.0.0
+# meta version: 1.0.1
 # meta author: DeathTerror
 # requires: pillow
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import html
-import os
 import tempfile
 import time
 from pathlib import Path
@@ -32,7 +31,7 @@ class AutoProfileMod(Module):
         "title": "AutoProfile",
         "description": "Rotate avatar, set/delete profile photos, update bio and premium emoji status.",
         "category": "profile",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "author": "DeathTerror",
         "commands": ".rotate, .rotateoff, .onprof, .dellprof, .desc, .prem",
         "usage": ".rotate +15 60 | .rotateoff | .onprof reply_photo | .dellprof | .desc text | .prem document_id/off",
@@ -46,14 +45,14 @@ class AutoProfileMod(Module):
         "rotate_interval": 300,
         "rotate_source": "",
         "last_rotated": None,
+        "rotate_photo_ids": [],
+        "keep_rotated": 1,
     }
 
     def __init__(self) -> None:
         super().__init__()
         self._rotate_task: asyncio.Task | None = None
         self._rotate_lock = asyncio.Lock()
-
-    # -------------------- lifecycle --------------------
 
     async def client_ready(self, client, db=None):
         if not self.get("state"):
@@ -70,7 +69,7 @@ class AutoProfileMod(Module):
         if not isinstance(state, dict):
             state = dict(self.DEFAULTS)
         for key, value in self.DEFAULTS.items():
-            state.setdefault(key, value)
+            state.setdefault(key, value.copy() if isinstance(value, list) else value)
         self.set("state", state)
         return state
 
@@ -93,8 +92,6 @@ class AutoProfileMod(Module):
                 raise
             except Exception:
                 await asyncio.sleep(30)
-
-    # -------------------- helpers --------------------
 
     @staticmethod
     def args_text(args) -> str:
@@ -143,6 +140,30 @@ class AutoProfileMod(Module):
             return True
         except Exception:
             return False
+
+    async def delete_photo_by_id(self, photo_id: int) -> bool:
+        if not photo_id:
+            return False
+        try:
+            photos = await self.client(functions.photos.GetUserPhotosRequest(user_id="me", offset=0, max_id=0, limit=80))
+            for photo in list(getattr(photos, "photos", []) or []):
+                if int(getattr(photo, "id", 0) or 0) == int(photo_id):
+                    return await self.delete_photo_obj(photo)
+        except Exception:
+            return False
+        return False
+
+    async def cleanup_rotated_history(self) -> None:
+        state = self.state()
+        ids = [int(x) for x in state.get("rotate_photo_ids", []) if str(x).isdigit()]
+        keep = max(1, int(state.get("keep_rotated", 1) or 1))
+        if len(ids) <= keep:
+            return
+        to_delete = ids[:-keep]
+        state["rotate_photo_ids"] = ids[-keep:]
+        self.save_state(state)
+        for photo_id in to_delete:
+            await self.delete_photo_by_id(photo_id)
 
     async def delete_latest_profile_photo(self) -> bool:
         photos = await self.client(functions.photos.GetUserPhotosRequest(user_id="me", offset=0, max_id=0, limit=1))
@@ -194,14 +215,18 @@ class AutoProfileMod(Module):
             try:
                 rotated_path = self.rotate_image(source, angle)
                 result = await self.upload_profile_photo(rotated_path)
-                # Do not delete user's old real avatars. We only keep Telegram history as is.
-                state["last_rotated"] = str(getattr(getattr(result, "photo", None), "id", "") or "")
-                self.save_state(state)
+                photo = getattr(result, "photo", None)
+                photo_id = int(getattr(photo, "id", 0) or 0)
+                if photo_id:
+                    ids = [int(x) for x in state.get("rotate_photo_ids", []) if str(x).isdigit()]
+                    ids.append(photo_id)
+                    state["rotate_photo_ids"] = ids
+                    state["last_rotated"] = str(photo_id)
+                    self.save_state(state)
+                    await self.cleanup_rotated_history()
                 return True
             finally:
                 self.cleanup(rotated_path)
-
-    # -------------------- commands --------------------
 
     @command("rotate", description="Rotate current avatar by angle every timer seconds", usage=".rotate +15 300")
     async def rotate_cmd(self, event, args):
@@ -231,13 +256,16 @@ class AutoProfileMod(Module):
         state["rotate_interval"] = interval
         state["rotate_angle"] = 0
         state["rotate_source"] = str(source)
+        state["rotate_photo_ids"] = []
+        state["last_rotated"] = None
         self.save_state(state)
         self.start_rotate_task()
         await self.rotate_once()
         await event.edit(
             "<b>Avatar rotation enabled.</b>\n"
             f"Step: <code>{step}</code> deg\n"
-            f"Timer: <code>{interval}</code> sec",
+            f"Timer: <code>{interval}</code> sec\n"
+            "Cleanup: <code>keeps only 1 rotated avatar</code>",
             parse_mode="html",
         )
 
@@ -246,7 +274,8 @@ class AutoProfileMod(Module):
         state = self.state()
         state["rotate_enabled"] = False
         self.save_state(state)
-        await event.edit("<b>Avatar rotation disabled.</b>", parse_mode="html")
+        await self.cleanup_rotated_history()
+        await event.edit("<b>Avatar rotation disabled.</b>\nRotated avatar history cleaned.", parse_mode="html")
 
     @command("onprof", description="Set replied photo as profile avatar", usage=".onprof reply_to_photo")
     async def onprof_cmd(self, event, args):
@@ -267,6 +296,12 @@ class AutoProfileMod(Module):
         try:
             ok = await self.delete_latest_profile_photo()
             if ok:
+                state = self.state()
+                latest = state.get("last_rotated")
+                if latest and str(latest).isdigit():
+                    state["rotate_photo_ids"] = [x for x in state.get("rotate_photo_ids", []) if int(x) != int(latest)]
+                    state["last_rotated"] = None
+                    self.save_state(state)
                 await event.edit("<b>Latest profile photo deleted.</b>", parse_mode="html")
             else:
                 await event.edit("<b>No profile photo to delete.</b>", parse_mode="html")
@@ -319,7 +354,8 @@ class AutoProfileMod(Module):
             "<b>AutoProfile</b>\n\n"
             f"Rotate: <code>{'ON' if state.get('rotate_enabled') else 'OFF'}</code>\n"
             f"Step: <code>{state.get('rotate_step')}</code> deg\n"
-            f"Timer: <code>{state.get('rotate_interval')}</code> sec\n\n"
+            f"Timer: <code>{state.get('rotate_interval')}</code> sec\n"
+            f"Rotated kept: <code>{state.get('keep_rotated', 1)}</code>\n\n"
             "Commands:\n"
             "<code>.rotate +15 300</code>\n"
             "<code>.rotateoff</code>\n"

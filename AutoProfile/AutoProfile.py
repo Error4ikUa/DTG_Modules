@@ -2,7 +2,7 @@
 # meta name: AutoProfile
 # meta description: Telegram profile automation: avatar rotate, photo set/delete, bio text and premium emoji status.
 # meta category: profile
-# meta version: 1.0.1
+# meta version: 1.0.3
 # meta author: DeathTerror
 # requires: pillow
 
@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from PIL import Image
+from PIL import Image, ImageOps
 from telethon import functions, types, utils
 from telethon.errors import RPCError
 
@@ -31,10 +31,10 @@ class AutoProfileMod(Module):
         "title": "AutoProfile",
         "description": "Rotate avatar, set/delete profile photos, update bio and premium emoji status.",
         "category": "profile",
-        "version": "1.0.1",
+        "version": "1.0.3",
         "author": "DeathTerror",
         "commands": ".rotate, .rotateoff, .onprof, .dellprof, .desc, .prem",
-        "usage": ".rotate +15 60 | .rotateoff | .onprof reply_photo | .dellprof | .desc text | .prem document_id/off",
+        "usage": ".rotate +15 60 | .rotateoff | .onprof reply_photo | .dellprof | .desc text | .prem emoji/off",
         "permissions": "owner",
     }
 
@@ -47,6 +47,7 @@ class AutoProfileMod(Module):
         "last_rotated": None,
         "rotate_photo_ids": [],
         "keep_rotated": 1,
+        "rotate_size": 1024,
     }
 
     def __init__(self) -> None:
@@ -75,6 +76,14 @@ class AutoProfileMod(Module):
 
     def save_state(self, state: dict) -> None:
         self.set("state", state)
+
+    def module_data_dir(self) -> Path:
+        path = Path(__file__).resolve().parent / ".autoprofile"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def rotate_source_path(self) -> Path:
+        return self.module_data_dir() / "rotate_source.jpg"
 
     def start_rotate_task(self) -> None:
         if self._rotate_task and not self._rotate_task.done():
@@ -129,6 +138,15 @@ class AutoProfileMod(Module):
         downloaded = await self.client.download_profile_photo("me", file=str(path), download_big=True)
         return Path(downloaded) if downloaded else None
 
+    async def save_rotate_source(self, source_path: Path) -> Path:
+        target = self.rotate_source_path()
+        size = int(self.state().get("rotate_size", 1024) or 1024)
+        with Image.open(source_path) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            img = ImageOps.fit(img, (size, size), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+            img.save(target, "JPEG", quality=96)
+        return target
+
     async def upload_profile_photo(self, image_path: Path):
         uploaded = await self.client.upload_file(str(image_path))
         return await self.client(functions.photos.UploadProfilePhotoRequest(file=uploaded))
@@ -145,7 +163,7 @@ class AutoProfileMod(Module):
         if not photo_id:
             return False
         try:
-            photos = await self.client(functions.photos.GetUserPhotosRequest(user_id="me", offset=0, max_id=0, limit=80))
+            photos = await self.client(functions.photos.GetUserPhotosRequest(user_id="me", offset=0, max_id=0, limit=100))
             for photo in list(getattr(photos, "photos", []) or []):
                 if int(getattr(photo, "id", 0) or 0) == int(photo_id):
                     return await self.delete_photo_obj(photo)
@@ -165,6 +183,18 @@ class AutoProfileMod(Module):
         for photo_id in to_delete:
             await self.delete_photo_by_id(photo_id)
 
+    async def cleanup_all_rotated_history(self) -> int:
+        state = self.state()
+        ids = [int(x) for x in state.get("rotate_photo_ids", []) if str(x).isdigit()]
+        deleted = 0
+        for photo_id in ids:
+            if await self.delete_photo_by_id(photo_id):
+                deleted += 1
+        state["rotate_photo_ids"] = []
+        state["last_rotated"] = None
+        self.save_state(state)
+        return deleted
+
     async def delete_latest_profile_photo(self) -> bool:
         photos = await self.client(functions.photos.GetUserPhotosRequest(user_id="me", offset=0, max_id=0, limit=1))
         items = list(getattr(photos, "photos", []) or [])
@@ -176,24 +206,21 @@ class AutoProfileMod(Module):
         parts = text.split()
         if len(parts) < 2:
             raise ValueError("usage")
-        angle_text = parts[0].replace("+", "")
-        step = int(angle_text)
+        step = int(parts[0].replace("+", ""))
         interval = int(parts[1])
         if step == 0:
             raise ValueError("angle_zero")
-        if interval < 15:
-            interval = 15
-        return step, interval
+        return step, max(15, interval)
 
     def rotate_image(self, source: Path, angle: int) -> Path:
         out = self.tmp_path(".jpg")
+        size = int(self.state().get("rotate_size", 1024) or 1024)
         with Image.open(source) as img:
-            img = img.convert("RGB")
-            rotated = img.rotate(-angle, expand=True, fillcolor=(0, 0, 0))
-            size = max(rotated.size)
-            canvas = Image.new("RGB", (size, size), (0, 0, 0))
-            canvas.paste(rotated, ((size - rotated.width) // 2, (size - rotated.height) // 2))
-            canvas.save(out, "JPEG", quality=95)
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            img = ImageOps.fit(img, (size, size), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+            # expand=False keeps fixed 1:1 canvas. No endless zoom-out and no huge black frame.
+            rotated = img.rotate(-angle, resample=Image.Resampling.BICUBIC, expand=False, fillcolor=(0, 0, 0))
+            rotated.save(out, "JPEG", quality=95)
         return out
 
     async def rotate_once(self) -> bool:
@@ -201,13 +228,14 @@ class AutoProfileMod(Module):
             state = self.state()
             source = Path(str(state.get("rotate_source") or ""))
             if not source.exists():
-                source = await self.get_current_avatar_path()
-                if not source:
+                current = await self.get_current_avatar_path()
+                if not current:
                     return False
+                source = await self.save_rotate_source(current)
+                self.cleanup(current)
                 state["rotate_source"] = str(source)
 
-            angle = int(state.get("rotate_angle", 0)) + int(state.get("rotate_step", 15))
-            angle %= 360
+            angle = (int(state.get("rotate_angle", 0)) + int(state.get("rotate_step", 15))) % 360
             state["rotate_angle"] = angle
             self.save_state(state)
 
@@ -228,6 +256,28 @@ class AutoProfileMod(Module):
             finally:
                 self.cleanup(rotated_path)
 
+    def extract_custom_emoji_id_from_message(self, message) -> Optional[int]:
+        if not message:
+            return None
+        for entity in list(getattr(message, "entities", []) or []):
+            if isinstance(entity, types.MessageEntityCustomEmoji):
+                document_id = int(getattr(entity, "document_id", 0) or 0)
+                if document_id:
+                    return document_id
+        return None
+
+    async def extract_premium_emoji_id(self, event, text: str) -> Optional[int]:
+        if text and text.strip().isdigit():
+            return int(text.strip())
+        document_id = self.extract_custom_emoji_id_from_message(getattr(event, "message", None))
+        if document_id:
+            return document_id
+        try:
+            reply = await event.get_reply_message()
+        except Exception:
+            reply = None
+        return self.extract_custom_emoji_id_from_message(reply)
+
     @command("rotate", description="Rotate current avatar by angle every timer seconds", usage=".rotate +15 300")
     async def rotate_cmd(self, event, args):
         text = self.args_text(args)
@@ -241,16 +291,17 @@ class AutoProfileMod(Module):
             )
             return
 
-        await event.edit("<b>Preparing avatar rotation...</b>", parse_mode="html")
-        source = await self.get_current_avatar_path()
-        if not source:
+        await event.edit("<b>Preparing stable avatar rotation...</b>", parse_mode="html")
+        await self.cleanup_all_rotated_history()
+        source_raw = await self.get_current_avatar_path()
+        if not source_raw:
             await event.edit("<b>No current profile photo found.</b>", parse_mode="html")
             return
 
+        source = await self.save_rotate_source(source_raw)
+        self.cleanup(source_raw)
+
         state = self.state()
-        old_source = state.get("rotate_source")
-        if old_source and old_source != str(source):
-            self.cleanup(old_source)
         state["rotate_enabled"] = True
         state["rotate_step"] = step
         state["rotate_interval"] = interval
@@ -265,6 +316,7 @@ class AutoProfileMod(Module):
             "<b>Avatar rotation enabled.</b>\n"
             f"Step: <code>{step}</code> deg\n"
             f"Timer: <code>{interval}</code> sec\n"
+            "Scale: <code>fixed 1:1, no zoom-out</code>\n"
             "Cleanup: <code>keeps only 1 rotated avatar</code>",
             parse_mode="html",
         )
@@ -274,8 +326,8 @@ class AutoProfileMod(Module):
         state = self.state()
         state["rotate_enabled"] = False
         self.save_state(state)
-        await self.cleanup_rotated_history()
-        await event.edit("<b>Avatar rotation disabled.</b>\nRotated avatar history cleaned.", parse_mode="html")
+        deleted = await self.cleanup_all_rotated_history()
+        await event.edit(f"<b>Avatar rotation disabled.</b>\nDeleted rotated avatars: <code>{deleted}</code>", parse_mode="html")
 
     @command("onprof", description="Set replied photo as profile avatar", usage=".onprof reply_to_photo")
     async def onprof_cmd(self, event, args):
@@ -322,26 +374,28 @@ class AutoProfileMod(Module):
         except Exception as exc:
             await event.edit(f"<b>Failed:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
 
-    @command("prem", description="Set premium emoji status by document id or off", usage=".prem 5368324170671202286 | .prem off")
+    @command("prem", description="Set premium emoji status by emoji or document id", usage=".prem emoji | .prem off")
     async def prem_cmd(self, event, args):
         text = self.args_text(args)
-        if not text:
-            await event.edit(
-                "<b>Usage:</b> <code>.prem emoji_document_id</code> or <code>.prem off</code>\n"
-                "Use a premium emoji document_id.",
-                parse_mode="html",
-            )
-            return
         try:
             if text.lower() in {"off", "clear", "none", "0"}:
                 status = None
-            else:
-                document_id = int(text.strip())
-                status = types.EmojiStatus(document_id=document_id)
+                await self.client(functions.account.UpdateEmojiStatusRequest(emoji_status=status))
+                await event.edit("<b>Premium emoji status cleared.</b>", parse_mode="html")
+                return
+
+            document_id = await self.extract_premium_emoji_id(event, text)
+            if not document_id:
+                await event.edit(
+                    "<b>Send a premium emoji with command:</b> <code>.prem 😎</code>\n"
+                    "Or reply <code>.prem</code> to a message with premium emoji.",
+                    parse_mode="html",
+                )
+                return
+
+            status = types.EmojiStatus(document_id=document_id)
             await self.client(functions.account.UpdateEmojiStatusRequest(emoji_status=status))
-            await event.edit("<b>Premium emoji status updated.</b>", parse_mode="html")
-        except ValueError:
-            await event.edit("<b>Need numeric premium emoji document_id.</b>", parse_mode="html")
+            await event.edit(f"<b>Premium emoji status updated.</b>\nID: <code>{document_id}</code>", parse_mode="html")
         except RPCError as exc:
             await event.edit(f"<b>Telegram error:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
         except Exception as exc:
@@ -355,6 +409,7 @@ class AutoProfileMod(Module):
             f"Rotate: <code>{'ON' if state.get('rotate_enabled') else 'OFF'}</code>\n"
             f"Step: <code>{state.get('rotate_step')}</code> deg\n"
             f"Timer: <code>{state.get('rotate_interval')}</code> sec\n"
+            f"Canvas: <code>{state.get('rotate_size', 1024)}x{state.get('rotate_size', 1024)}</code>\n"
             f"Rotated kept: <code>{state.get('keep_rotated', 1)}</code>\n\n"
             "Commands:\n"
             "<code>.rotate +15 300</code>\n"
@@ -362,6 +417,6 @@ class AutoProfileMod(Module):
             "<code>.onprof</code> reply to photo\n"
             "<code>.dellprof</code>\n"
             "<code>.desc text</code>\n"
-            "<code>.prem document_id/off</code>",
+            "<code>.prem 😎</code> or reply <code>.prem</code>",
             parse_mode="html",
         )

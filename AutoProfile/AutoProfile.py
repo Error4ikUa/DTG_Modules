@@ -2,7 +2,7 @@
 # meta name: AutoProfile
 # meta description: Telegram profile automation: avatar rotate, photo set/delete, bio text and premium emoji status.
 # meta category: profile
-# meta version: 1.0.3
+# meta version: 1.1.0
 # meta author: DeathTerror
 # requires: pillow
 
@@ -19,8 +19,15 @@ from PIL import Image, ImageOps
 from telethon import functions, types, utils
 from telethon.errors import RPCError
 
-from deathtg.loader import Module
 from deathtg.command import command
+from deathtg.loader import Module
+
+try:
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+    RESAMPLE_BICUBIC = Image.Resampling.BICUBIC
+except AttributeError:
+    RESAMPLE_LANCZOS = Image.LANCZOS
+    RESAMPLE_BICUBIC = Image.BICUBIC
 
 
 class AutoProfileMod(Module):
@@ -31,10 +38,10 @@ class AutoProfileMod(Module):
         "title": "AutoProfile",
         "description": "Rotate avatar, set/delete profile photos, update bio and premium emoji status.",
         "category": "profile",
-        "version": "1.0.3",
+        "version": "1.1.0",
         "author": "DeathTerror",
-        "commands": ".rotate, .rotateoff, .onprof, .dellprof, .desc, .prem",
-        "usage": ".rotate +15 60 | .rotateoff | .onprof reply_photo | .dellprof | .desc text | .prem emoji/off",
+        "commands": ".rotate, .rotateoff, .onprof, .dellprof, .desc, .prem, .premoff",
+        "usage": ".rotate +15 60 | .rotateoff | .prem emoji [emoji...] [30] | .premoff",
         "permissions": "owner",
     }
 
@@ -48,22 +55,32 @@ class AutoProfileMod(Module):
         "rotate_photo_ids": [],
         "keep_rotated": 1,
         "rotate_size": 1024,
+        "premium_enabled": False,
+        "premium_emoji_ids": [],
+        "premium_interval": 30,
+        "premium_index": 0,
     }
 
     def __init__(self) -> None:
         super().__init__()
         self._rotate_task: asyncio.Task | None = None
+        self._premium_task: asyncio.Task | None = None
         self._rotate_lock = asyncio.Lock()
+        self._premium_lock = asyncio.Lock()
 
     async def client_ready(self, client, db=None):
         if not self.get("state"):
             self.set("state", dict(self.DEFAULTS))
         self.start_rotate_task()
+        self.start_premium_task()
 
     async def on_unload(self):
         if self._rotate_task:
             self._rotate_task.cancel()
             self._rotate_task = None
+        if self._premium_task:
+            self._premium_task.cancel()
+            self._premium_task = None
 
     def state(self) -> dict:
         state = self.get("state", None)
@@ -90,13 +107,30 @@ class AutoProfileMod(Module):
             return
         self._rotate_task = asyncio.create_task(self.rotate_loop())
 
+    def start_premium_task(self) -> None:
+        if self._premium_task and not self._premium_task.done():
+            return
+        self._premium_task = asyncio.create_task(self.premium_loop())
+
     async def rotate_loop(self) -> None:
         while True:
             try:
                 state = self.state()
-                await asyncio.sleep(max(15, int(state.get("rotate_interval", 300))))
+                await asyncio.sleep(max(15, int(state.get("rotate_interval", 300) or 300)))
                 if state.get("rotate_enabled"):
                     await self.rotate_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(30)
+
+    async def premium_loop(self) -> None:
+        while True:
+            try:
+                state = self.state()
+                await asyncio.sleep(max(15, int(state.get("premium_interval", 30) or 30)))
+                if state.get("premium_enabled"):
+                    await self.premium_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -139,11 +173,13 @@ class AutoProfileMod(Module):
         return Path(downloaded) if downloaded else None
 
     async def save_rotate_source(self, source_path: Path) -> Path:
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source image not found: {source_path}")
         target = self.rotate_source_path()
         size = int(self.state().get("rotate_size", 1024) or 1024)
         with Image.open(source_path) as img:
             img = ImageOps.exif_transpose(img).convert("RGB")
-            img = ImageOps.fit(img, (size, size), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+            img = ImageOps.fit(img, (size, size), method=RESAMPLE_LANCZOS, centering=(0.5, 0.5))
             img.save(target, "JPEG", quality=96)
         return target
 
@@ -217,9 +253,8 @@ class AutoProfileMod(Module):
         size = int(self.state().get("rotate_size", 1024) or 1024)
         with Image.open(source) as img:
             img = ImageOps.exif_transpose(img).convert("RGB")
-            img = ImageOps.fit(img, (size, size), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-            # expand=False keeps fixed 1:1 canvas. No endless zoom-out and no huge black frame.
-            rotated = img.rotate(-angle, resample=Image.Resampling.BICUBIC, expand=False, fillcolor=(0, 0, 0))
+            img = ImageOps.fit(img, (size, size), method=RESAMPLE_LANCZOS, centering=(0.5, 0.5))
+            rotated = img.rotate(-angle, resample=RESAMPLE_BICUBIC, expand=False, fillcolor=(0, 0, 0))
             rotated.save(out, "JPEG", quality=95)
         return out
 
@@ -256,27 +291,65 @@ class AutoProfileMod(Module):
             finally:
                 self.cleanup(rotated_path)
 
-    def extract_custom_emoji_id_from_message(self, message) -> Optional[int]:
+    @staticmethod
+    def parse_trailing_interval(text: str, has_custom_emoji: bool) -> tuple[Optional[int], list[int]]:
+        parts = text.split()
+        numeric = [int(part) for part in parts if part.isdigit()]
+        if not parts or not parts[-1].isdigit():
+            return None, numeric
+        if has_custom_emoji or len(numeric) >= 2:
+            return max(15, int(parts[-1])), numeric[:-1]
+        return None, numeric
+
+    def extract_custom_emoji_ids_from_message(self, message) -> list[int]:
         if not message:
-            return None
+            return []
+        ids = []
         for entity in list(getattr(message, "entities", []) or []):
             if isinstance(entity, types.MessageEntityCustomEmoji):
                 document_id = int(getattr(entity, "document_id", 0) or 0)
                 if document_id:
-                    return document_id
-        return None
+                    ids.append(document_id)
+        return ids
 
-    async def extract_premium_emoji_id(self, event, text: str) -> Optional[int]:
-        if text and text.strip().isdigit():
-            return int(text.strip())
-        document_id = self.extract_custom_emoji_id_from_message(getattr(event, "message", None))
-        if document_id:
-            return document_id
+    async def extract_premium_args(self, event, text: str) -> tuple[list[int], Optional[int]]:
+        custom_ids = self.extract_custom_emoji_ids_from_message(getattr(event, "message", None))
+        interval, numeric_ids = self.parse_trailing_interval(text, bool(custom_ids))
+        ids = custom_ids + numeric_ids
+        if ids:
+            return ids, interval
         try:
             reply = await event.get_reply_message()
         except Exception:
             reply = None
-        return self.extract_custom_emoji_id_from_message(reply)
+        return self.extract_custom_emoji_ids_from_message(reply), interval
+
+    async def set_premium_status(self, document_id: int | None) -> None:
+        status = types.EmojiStatus(document_id=document_id) if document_id else types.EmojiStatusEmpty()
+        await self.client(functions.account.UpdateEmojiStatusRequest(emoji_status=status))
+
+    async def premium_once(self) -> bool:
+        async with self._premium_lock:
+            state = self.state()
+            ids = [int(x) for x in state.get("premium_emoji_ids", []) if str(x).isdigit()]
+            if not ids:
+                state["premium_enabled"] = False
+                self.save_state(state)
+                return False
+
+            index = int(state.get("premium_index", 0) or 0) % len(ids)
+            await self.set_premium_status(ids[index])
+            state["premium_index"] = (index + 1) % len(ids)
+            self.save_state(state)
+            return True
+
+    async def disable_premium_rotation(self, clear: bool = True) -> None:
+        state = self.state()
+        state["premium_enabled"] = False
+        state["premium_index"] = 0
+        self.save_state(state)
+        if clear:
+            await self.set_premium_status(None)
 
     @command("rotate", description="Rotate current avatar by angle every timer seconds", usage=".rotate +15 300")
     async def rotate_cmd(self, event, args):
@@ -374,30 +447,61 @@ class AutoProfileMod(Module):
         except Exception as exc:
             await event.edit(f"<b>Failed:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
 
-    @command("prem", description="Set premium emoji status by emoji or document id", usage=".prem emoji | .prem off")
+    @command("prem", description="Set premium emoji status or rotate statuses", usage=".prem emoji | .prem emoji emoji 30")
     async def prem_cmd(self, event, args):
         text = self.args_text(args)
         try:
             if text.lower() in {"off", "clear", "none", "0"}:
-                status = None
-                await self.client(functions.account.UpdateEmojiStatusRequest(emoji_status=status))
-                await event.edit("<b>Premium emoji status cleared.</b>", parse_mode="html")
+                await self.disable_premium_rotation(clear=True)
+                await event.edit("<b>Premium emoji rotation disabled.</b>\nStatus cleared.", parse_mode="html")
                 return
 
-            document_id = await self.extract_premium_emoji_id(event, text)
-            if not document_id:
+            ids, interval = await self.extract_premium_args(event, text)
+            if not ids:
                 await event.edit(
-                    "<b>Send a premium emoji with command:</b> <code>.prem 😎</code>\n"
-                    "Or reply <code>.prem</code> to a message with premium emoji.",
+                    "<b>Usage:</b>\n"
+                    "<code>.prem emoji</code> - set one premium status\n"
+                    "<code>.prem emoji emoji 30</code> - rotate statuses every 30 sec\n"
+                    "<code>.premoff</code> - stop and clear",
                     parse_mode="html",
                 )
                 return
 
-            status = types.EmojiStatus(document_id=document_id)
-            await self.client(functions.account.UpdateEmojiStatusRequest(emoji_status=status))
-            await event.edit(f"<b>Premium emoji status updated.</b>\nID: <code>{document_id}</code>", parse_mode="html")
+            state = self.state()
+            if len(ids) > 1 or interval is not None:
+                interval = interval or int(state.get("premium_interval", 30) or 30)
+                interval = max(15, interval)
+                state["premium_enabled"] = True
+                state["premium_emoji_ids"] = ids
+                state["premium_interval"] = interval
+                state["premium_index"] = 1 % len(ids)
+                self.save_state(state)
+                self.start_premium_task()
+                await self.set_premium_status(ids[0])
+                await event.edit(
+                    "<b>Premium emoji auto-rotation enabled.</b>\n"
+                    f"Statuses: <code>{len(ids)}</code>\n"
+                    f"Timer: <code>{interval}</code> sec",
+                    parse_mode="html",
+                )
+                return
+
+            state["premium_enabled"] = False
+            state["premium_emoji_ids"] = ids[:1]
+            state["premium_index"] = 0
+            self.save_state(state)
+            await self.set_premium_status(ids[0])
+            await event.edit(f"<b>Premium emoji status updated.</b>\nID: <code>{ids[0]}</code>", parse_mode="html")
         except RPCError as exc:
             await event.edit(f"<b>Telegram error:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
+        except Exception as exc:
+            await event.edit(f"<b>Failed:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
+
+    @command("premoff", description="Disable premium emoji status rotation and clear status", usage=".premoff")
+    async def premoff_cmd(self, event, args):
+        try:
+            await self.disable_premium_rotation(clear=True)
+            await event.edit("<b>Premium emoji rotation disabled.</b>\nStatus cleared.", parse_mode="html")
         except Exception as exc:
             await event.edit(f"<b>Failed:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
 
@@ -406,17 +510,22 @@ class AutoProfileMod(Module):
         state = self.state()
         await event.edit(
             "<b>AutoProfile</b>\n\n"
-            f"Rotate: <code>{'ON' if state.get('rotate_enabled') else 'OFF'}</code>\n"
+            f"Avatar rotate: <code>{'ON' if state.get('rotate_enabled') else 'OFF'}</code>\n"
             f"Step: <code>{state.get('rotate_step')}</code> deg\n"
             f"Timer: <code>{state.get('rotate_interval')}</code> sec\n"
             f"Canvas: <code>{state.get('rotate_size', 1024)}x{state.get('rotate_size', 1024)}</code>\n"
             f"Rotated kept: <code>{state.get('keep_rotated', 1)}</code>\n\n"
+            f"Premium rotate: <code>{'ON' if state.get('premium_enabled') else 'OFF'}</code>\n"
+            f"Premium timer: <code>{state.get('premium_interval', 30)}</code> sec\n"
+            f"Premium statuses: <code>{len(state.get('premium_emoji_ids', []))}</code>\n\n"
             "Commands:\n"
             "<code>.rotate +15 300</code>\n"
             "<code>.rotateoff</code>\n"
             "<code>.onprof</code> reply to photo\n"
             "<code>.dellprof</code>\n"
             "<code>.desc text</code>\n"
-            "<code>.prem 😎</code> or reply <code>.prem</code>",
+            "<code>.prem emoji</code>\n"
+            "<code>.prem emoji emoji 30</code>\n"
+            "<code>.premoff</code>",
             parse_mode="html",
         )

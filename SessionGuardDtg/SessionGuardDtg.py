@@ -1,8 +1,8 @@
 # meta developer: @DeathTerror
 # meta name: SessionGuardDtg
-# meta description: Telegram session guard with allowed devices, inline whitelist and auto-kick mode.
+# meta description: Inline Telegram session guard with allow/kick policy per device.
 # meta category: security
-# meta version: 1.1.0
+# meta version: 2.0.0
 # meta author: DeathTerror
 # requires: none
 
@@ -11,35 +11,34 @@ from __future__ import annotations
 import asyncio
 import html
 import time
-from typing import Any, List, Tuple
+from typing import Any
 
 from telethon import functions
 from telethon.errors import RPCError
 
-from deathtg.loader import Module
 from deathtg.command import command
+from deathtg.loader import Module
 
 
 class SessionGuardDtgMod(Module):
-    """Telegram active sessions guard for DeathTG."""
+    """Inline Telegram sessions guard for DeathTG."""
 
     strings = {
         "name": "SessionGuardDtg",
         "title": "SessionGuardDtg",
-        "description": "Protect Telegram account from unknown active sessions with inline whitelist and auto-kick.",
+        "description": "Inline session security with per-device allow/kick policy.",
         "category": "security",
-        "version": "1.1.0",
+        "version": "2.0.0",
         "author": "DeathTerror",
-        "commands": ".sg, .sglist, .sgmode, .sgscan, .sgkick, .sglog, .sgallowed, .sgallow, .sgdel",
-        "usage": ".sg | .sglist | .sgmode on/off | .sgscan | .sgkick | .sglog here/off",
+        "commands": ".secconfig, .secstart, .secoff",
+        "usage": ".secconfig | .secstart | .secoff",
         "permissions": "owner",
     }
 
     DEFAULTS = {
         "enabled": False,
         "interval": 90,
-        "allowed_hashes": [],
-        "allowed_names": [],
+        "device_policy": {},
         "log_chat_id": None,
         "last_seen": {},
     }
@@ -50,12 +49,9 @@ class SessionGuardDtgMod(Module):
         self._last_sessions: list[dict] = []
         self._lock = asyncio.Lock()
 
-    # -------------------- lifecycle --------------------
-
     async def client_ready(self, client, db=None):
         if not self.get("state"):
             self.set("state", dict(self.DEFAULTS))
-        await self.ensure_current_allowed()
         self.start_task()
 
     async def on_unload(self):
@@ -72,7 +68,7 @@ class SessionGuardDtgMod(Module):
         while True:
             try:
                 state = self.state()
-                await asyncio.sleep(max(20, int(state.get("interval", 90))))
+                await asyncio.sleep(max(20, int(state.get("interval", 90) or 90)))
                 if state.get("enabled"):
                     await self.scan_and_kick(notify=True)
             except asyncio.CancelledError:
@@ -80,14 +76,28 @@ class SessionGuardDtgMod(Module):
             except Exception:
                 await asyncio.sleep(30)
 
-    # -------------------- state/helpers --------------------
-
     def state(self) -> dict:
         state = self.get("state", None)
         if not isinstance(state, dict):
             state = dict(self.DEFAULTS)
         for key, value in self.DEFAULTS.items():
             state.setdefault(key, value.copy() if isinstance(value, (list, dict)) else value)
+
+        policy = state.get("device_policy")
+        if not isinstance(policy, dict):
+            state["device_policy"] = {}
+        else:
+            cleaned = {}
+            for key, value in policy.items():
+                mode = str(value).lower().strip()
+                if mode in {"allow", "kick"}:
+                    cleaned[str(key)] = mode
+            state["device_policy"] = cleaned
+
+        last_seen = state.get("last_seen")
+        if not isinstance(last_seen, dict):
+            state["last_seen"] = {}
+
         self.set("state", state)
         return state
 
@@ -103,6 +113,11 @@ class SessionGuardDtgMod(Module):
     @staticmethod
     def esc(value: Any) -> str:
         return html.escape(str(value or ""), quote=False)
+
+    @staticmethod
+    def short(value: Any, limit: int = 34) -> str:
+        text = " ".join(str(value or "").split())
+        return text if len(text) <= limit else text[: limit - 3] + "..."
 
     @staticmethod
     def norm(value: Any) -> str:
@@ -138,63 +153,61 @@ class SessionGuardDtgMod(Module):
     async def get_sessions(self) -> list[dict]:
         result = await self.client(functions.account.GetAuthorizationsRequest())
         sessions = [self.session_to_dict(x) for x in getattr(result, "authorizations", [])]
-        sessions.sort(key=lambda x: (not x.get("current"), x.get("name", "")))
+        sessions.sort(key=lambda x: (not x.get("current"), self.norm(x.get("name"))))
         self._last_sessions = sessions
         return sessions
 
-    def allowed_hashes(self) -> set[int]:
-        out = set()
-        for x in self.state().get("allowed_hashes", []):
-            try:
-                out.add(int(x))
-            except Exception:
-                pass
+    def policy_map(self) -> dict[str, str]:
+        state = self.state()
+        out = {}
+        for key, value in (state.get("device_policy") or {}).items():
+            mode = str(value).lower().strip()
+            if mode in {"allow", "kick"}:
+                out[str(key)] = mode
         return out
 
-    def is_allowed(self, item: dict) -> bool:
+    def policy_for(self, item: dict) -> str | None:
         if item.get("current"):
-            return True
-        state = self.state()
-        allowed_names = {self.norm(x) for x in state.get("allowed_names", []) if str(x).strip()}
-        return int(item.get("hash") or 0) in self.allowed_hashes() or self.norm(item.get("name")) in allowed_names
-
-    async def ensure_current_allowed(self) -> None:
-        try:
-            sessions = await self.get_sessions()
-        except Exception:
-            return
-        state = self.state()
-        changed = False
-        for item in sessions:
-            if item.get("current"):
-                h = int(item.get("hash") or 0)
-                name = item.get("name") or ""
-                if h and h not in state["allowed_hashes"]:
-                    state["allowed_hashes"].append(h)
-                    changed = True
-                if name and name not in state["allowed_names"]:
-                    state["allowed_names"].append(name)
-                    changed = True
-        if changed:
-            self.save_state(state)
-
-    def find_session(self, selector: str) -> dict | None:
-        selector = selector.strip()
-        if not selector:
+            return "allow"
+        h = int(item.get("hash") or 0)
+        if not h:
             return None
-        if selector.isdigit():
-            index = int(selector) - 1
-            if 0 <= index < len(self._last_sessions):
-                return self._last_sessions[index]
-            target = int(selector)
-            for item in self._last_sessions:
-                if int(item.get("hash") or 0) == target:
-                    return item
-        needle = self.norm(selector)
-        for item in self._last_sessions:
-            if needle in self.norm(item.get("name")):
-                return item
-        return None
+        return self.policy_map().get(str(h))
+
+    def is_allowed(self, item: dict) -> bool:
+        return self.policy_for(item) == "allow"
+
+    def should_kick(self, item: dict) -> bool:
+        if item.get("current"):
+            return False
+        return self.policy_for(item) != "allow"
+
+    def set_policy(self, session_hash: int, mode: str | None) -> None:
+        state = self.state()
+        policy = dict(state.get("device_policy") or {})
+        key = str(int(session_hash))
+        if mode in {"allow", "kick"}:
+            policy[key] = mode
+        else:
+            policy.pop(key, None)
+        state["device_policy"] = policy
+        self.save_state(state)
+
+    def toggle_policy(self, item: dict) -> str:
+        if item.get("current"):
+            return "allow"
+        h = int(item.get("hash") or 0)
+        if not h:
+            return "allow"
+        current = self.policy_for(item)
+        if current is None:
+            new_mode = "allow"
+        elif current == "allow":
+            new_mode = "kick"
+        else:
+            new_mode = "allow"
+        self.set_policy(h, new_mode)
+        return new_mode
 
     async def notify(self, text: str) -> None:
         state = self.state()
@@ -204,153 +217,98 @@ class SessionGuardDtgMod(Module):
         except Exception:
             pass
 
-    # -------------------- ui --------------------
-
-    def status_text(self) -> str:
-        state = self.state()
-        return (
-            "<b>SessionGuardDtg</b>\n\n"
-            f"Auto-kick: <code>{'ON' if state.get('enabled') else 'OFF'}</code>\n"
-            f"Interval: <code>{int(state.get('interval', 90))} sec</code>\n"
-            f"Allowed hashes: <code>{len(state.get('allowed_hashes', []))}</code>\n"
-            f"Allowed names: <code>{len(state.get('allowed_names', []))}</code>\n"
-            f"Logs: <code>{self.esc(state.get('log_chat_id') or 'Saved Messages')}</code>\n\n"
-            "<code>.sglist</code> - inline devices\n"
-            "<code>.sgmode on/off</code> - auto-kick\n"
-            "<code>.sgscan</code> - check only\n"
-            "<code>.sgkick</code> - kick unknown now"
-        )
+    def policy_icon(self, item: dict) -> str:
+        if item.get("current"):
+            return "🛡️"
+        mode = self.policy_for(item)
+        if mode == "allow":
+            return "✅"
+        if mode == "kick":
+            return "❌"
+        return "❔"
 
     def sessions_text(self, sessions: list[dict]) -> str:
         state = self.state()
-        unknown = len([x for x in sessions if not self.is_allowed(x)])
+        unknown = len([x for x in sessions if not x.get("current") and self.policy_for(x) is None])
         lines = [
-            "<b>SessionGuardDtg devices</b>",
+            "<b>SessionGuardDtg • SEC CONFIG</b>",
             "",
-            f"Auto-kick: <code>{'ON' if state.get('enabled') else 'OFF'}</code>",
+            f"Mode: <code>{'SEC START' if state.get('enabled') else 'SEC OFF'}</code>",
             f"Sessions: <code>{len(sessions)}</code> | Unknown: <code>{unknown}</code>",
             "",
-            "Tap device to allow/remove from whitelist.",
-            "✅ = allowed, ⚠️ = unknown, 🟦 = current",
+            "<blockquote>❔ not configured\n✅ allow (do not kick)\n❌ always kick\n🛡️ current session</blockquote>",
+            "Tap a device button to change status.",
         ]
         return "\n".join(lines)
 
-    def detail_text(self, item: dict) -> str:
-        status = "CURRENT" if item.get("current") else ("ALLOWED" if self.is_allowed(item) else "UNKNOWN")
-        geo = " ".join(x for x in [item.get("country"), item.get("region")] if x) or "unknown"
-        return (
-            "<b>Device details</b>\n\n"
-            f"Status: <code>{status}</code>\n"
-            f"Device: <code>{self.esc(item.get('name'))}</code>\n"
-            f"Hash: <code>{item.get('hash')}</code>\n"
-            f"IP: <code>{self.esc(item.get('ip'))}</code>\n"
-            f"Geo: <code>{self.esc(geo)}</code>\n"
-            f"Created: <code>{self.esc(item.get('date_created'))}</code>\n"
-            f"Active: <code>{self.esc(item.get('date_active'))}</code>"
-        )
+    def session_button_text(self, item: dict) -> str:
+        icon = self.policy_icon(item)
+        name = item.get("device_model") or item.get("name") or "device"
+        if item.get("current"):
+            name = f"{name} (current)"
+        return f"{icon} {self.short(name, 38)}"
 
     def session_buttons(self, sessions: list[dict]):
         rows = []
         for index, item in enumerate(sessions):
-            if item.get("current"):
-                icon = "🟦"
-            elif self.is_allowed(item):
-                icon = "✅"
-            else:
-                icon = "⚠️"
-            name = str(item.get("device_model") or item.get("name") or "device")[:30]
             rows.append([
-                {"text": f"{icon} {name}", "callback": self.toggle_callback, "args": (index,)},
-                {"text": "Info", "callback": self.info_callback, "args": (index,)},
+                {"text": self.session_button_text(item), "callback": self.toggle_callback, "args": (index,)},
             ])
-        mode_text = "Auto-kick: ON" if self.state().get("enabled") else "Auto-kick: OFF"
+
+        mode_btn = "⏹ SEC OFF" if self.state().get("enabled") else "▶️ SEC START"
         rows.append([
-            {"text": mode_text, "callback": self.mode_callback, "args": ()},
-            {"text": "Refresh", "callback": self.refresh_callback, "args": ()},
+            {"text": mode_btn, "callback": self.mode_callback, "args": ()},
+            {"text": "🔄 Refresh", "callback": self.refresh_callback, "args": ()},
         ])
         rows.append([
-            {"text": "Kick unknown", "callback": self.kick_callback, "args": ()},
+            {"text": "🧹 Kick now", "callback": self.kick_callback, "args": ()},
             {"text": "Close", "callback": self.close_callback, "args": ()},
         ])
         return self.inline_buttons(*rows)
 
-    def detail_buttons(self, index: int):
-        return self.inline_buttons(
-            [{"text": "Toggle allowed", "callback": self.toggle_callback, "args": (index,)}],
-            [{"text": "Back", "callback": self.refresh_callback, "args": ()}, {"text": "Close", "callback": self.close_callback, "args": ()}],
-        )
-
-    def allowed_text(self) -> str:
-        state = self.state()
-        lines = ["<b>Allowed devices</b>", "", "<b>Hashes:</b>"]
-        lines.extend([f"- <code>{h}</code>" for h in state.get("allowed_hashes", [])] or ["- empty"])
-        lines += ["", "<b>Names:</b>"]
-        lines.extend([f"- <code>{self.esc(name)}</code>" for name in state.get("allowed_names", [])] or ["- empty"])
-        return "\n".join(lines)
-
-    # -------------------- allow/remove/kick --------------------
-
-    def toggle_allowed(self, item: dict) -> bool:
-        state = self.state()
-        h = int(item.get("hash") or 0)
-        name = item.get("name") or ""
-        allowed = self.is_allowed(item)
-        if allowed and not item.get("current"):
-            state["allowed_hashes"] = [x for x in state.get("allowed_hashes", []) if int(x) != h]
-            state["allowed_names"] = [x for x in state.get("allowed_names", []) if self.norm(x) != self.norm(name)]
-            self.save_state(state)
-            return False
-        if h and h not in state["allowed_hashes"]:
-            state["allowed_hashes"].append(h)
-        if name and name not in state["allowed_names"]:
-            state["allowed_names"].append(name)
-        self.save_state(state)
-        return True
-
-    async def scan_and_kick(self, notify: bool = False) -> Tuple[list[dict], list[dict]]:
+    async def scan_and_kick(self, notify: bool = False, force_kick: bool = False) -> tuple[list[dict], list[dict]]:
         async with self._lock:
             sessions = await self.get_sessions()
-            unknown = [x for x in sessions if not self.is_allowed(x)]
+            targets = [x for x in sessions if self.should_kick(x)]
             kicked = []
+
             state = self.state()
             last_seen = state.get("last_seen", {}) if isinstance(state.get("last_seen"), dict) else {}
 
-            for item in unknown:
+            for item in targets:
                 h = int(item.get("hash") or 0)
+                if not h:
+                    continue
+
                 key = str(h)
                 if notify and key not in last_seen:
                     await self.notify(
-                        "<b>SessionGuard alert</b>\nUnknown Telegram session detected.\n\n"
+                        "<b>SessionGuard alert</b>\n"
+                        "Device is not allowed by config.\n\n"
                         f"Device: <code>{self.esc(item.get('name'))}</code>\n"
                         f"Hash: <code>{h}</code>\n"
                         f"IP: <code>{self.esc(item.get('ip'))}</code>"
                     )
                 last_seen[key] = int(time.time())
 
-                if state.get("enabled") and h:
+                if state.get("enabled") or force_kick:
                     try:
                         await self.client(functions.account.ResetAuthorizationRequest(hash=h))
                         kicked.append(item)
                         await self.notify(
-                            "<b>SessionGuard kicked unknown session</b>\n"
-                            f"Device: <code>{self.esc(item.get('name'))}</code>\nHash: <code>{h}</code>"
+                            "<b>SessionGuard kicked session</b>\n"
+                            f"Device: <code>{self.esc(item.get('name'))}</code>\n"
+                            f"Hash: <code>{h}</code>"
                         )
                     except (RPCError, Exception) as exc:
                         await self.notify(f"<b>SessionGuard kick failed:</b> <code>{self.esc(exc)}</code>")
 
             state["last_seen"] = last_seen
             self.save_state(state)
-            return unknown, kicked
+            return targets, kicked
 
-    # -------------------- commands --------------------
-
-    @command("sg", description="Show SessionGuard status", usage=".sg")
-    async def sg_cmd(self, event, args):
-        self.start_task()
-        await event.edit(self.status_text(), parse_mode="html")
-
-    @command("sglist", description="Inline active Telegram sessions", usage=".sglist")
-    async def sglist_cmd(self, event, args):
+    @command("secconfig", description="Open inline session config", usage=".secconfig")
+    async def secconfig_cmd(self, event, args):
         try:
             sessions = await self.get_sessions()
             await self.inline_send(
@@ -362,93 +320,28 @@ class SessionGuardDtgMod(Module):
                 ttl=3600,
             )
         except Exception as exc:
-            await event.edit(f"<b>Failed to get sessions:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
+            await event.edit(f"<b>Failed to load sessions:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
 
-    @command("sgallow", description="Allow session by number/hash/name", usage=".sgallow 1 | .sgallow current | .sgallow name")
-    async def sgallow_cmd(self, event, args):
-        selector = self.args_text(args)
-        if not self._last_sessions:
-            await self.get_sessions()
-        if not selector or selector.lower() == "current":
-            await self.ensure_current_allowed()
-            await event.edit("<b>Current session allowed.</b>", parse_mode="html")
-            return
-        item = self.find_session(selector)
-        if item:
-            allowed = self.toggle_allowed(item)
-            await event.edit(f"<b>Device allowed:</b> <code>{'YES' if allowed else 'NO'}</code>", parse_mode="html")
-            return
+    @command("secstart", description="Enable session guard and kick not-allowed sessions", usage=".secstart")
+    async def secstart_cmd(self, event, args):
         state = self.state()
-        if selector not in state["allowed_names"]:
-            state["allowed_names"].append(selector)
-            self.save_state(state)
-        await event.edit(f"<b>Allowed name added:</b> <code>{self.esc(selector)}</code>", parse_mode="html")
-
-    @command("sgdel", description="Remove allowed device by hash/name", usage=".sgdel hash_or_name")
-    async def sgdel_cmd(self, event, args):
-        selector = self.args_text(args)
-        if not selector:
-            await event.edit("<b>Usage:</b> <code>.sgdel hash_or_name</code>", parse_mode="html")
-            return
-        state = self.state()
-        before = len(state["allowed_hashes"]) + len(state["allowed_names"])
-        if selector.isdigit():
-            target = int(selector)
-            state["allowed_hashes"] = [h for h in state["allowed_hashes"] if int(h) != target]
-        needle = self.norm(selector)
-        state["allowed_names"] = [name for name in state["allowed_names"] if needle not in self.norm(name)]
-        self.save_state(state)
-        after = len(state["allowed_hashes"]) + len(state["allowed_names"])
-        await event.edit(f"<b>Removed:</b> <code>{before - after}</code>", parse_mode="html")
-
-    @command("sgmode", description="Enable or disable auto-kick", usage=".sgmode on/off")
-    async def sgmode_cmd(self, event, args):
-        value = self.args_text(args).lower()
-        if value not in {"on", "off"}:
-            await event.edit("<b>Usage:</b> <code>.sgmode on</code> or <code>.sgmode off</code>", parse_mode="html")
-            return
-        await self.ensure_current_allowed()
-        state = self.state()
-        state["enabled"] = value == "on"
+        state["enabled"] = True
         self.save_state(state)
         self.start_task()
-        await event.edit(f"<b>SessionGuard auto-kick:</b> <code>{value.upper()}</code>", parse_mode="html")
-
-    @command("sgscan", description="Scan Telegram sessions without kicking", usage=".sgscan")
-    async def sgscan_cmd(self, event, args):
-        sessions = await self.get_sessions()
-        unknown = [x for x in sessions if not self.is_allowed(x)]
-        await event.edit(f"<b>Scan complete.</b> Unknown sessions: <code>{len(unknown)}</code>", parse_mode="html")
-
-    @command("sgkick", description="Kick unauthorized Telegram sessions now", usage=".sgkick")
-    async def sgkick_cmd(self, event, args):
-        unknown, kicked = await self.scan_and_kick(notify=True)
+        targets, kicked = await self.scan_and_kick(notify=True)
         await event.edit(
-            f"<b>Manual kick complete.</b>\nUnknown: <code>{len(unknown)}</code>\nKicked: <code>{len(kicked)}</code>",
+            "<b>SEC START enabled.</b>\n"
+            f"Targets: <code>{len(targets)}</code>\n"
+            f"Kicked now: <code>{len(kicked)}</code>",
             parse_mode="html",
         )
 
-    @command("sglog", description="Set alert chat", usage=".sglog here/off")
-    async def sglog_cmd(self, event, args):
-        value = self.args_text(args).lower()
+    @command("secoff", description="Disable session guard", usage=".secoff")
+    async def secoff_cmd(self, event, args):
         state = self.state()
-        if value == "off":
-            state["log_chat_id"] = None
-            self.save_state(state)
-            await event.edit("<b>Logs:</b> <code>Saved Messages</code>", parse_mode="html")
-            return
-        if value == "here" or not value:
-            state["log_chat_id"] = int(event.chat_id)
-            self.save_state(state)
-            await event.edit("<b>Logs:</b> <code>current chat</code>", parse_mode="html")
-            return
-        await event.edit("<b>Usage:</b> <code>.sglog here</code> or <code>.sglog off</code>", parse_mode="html")
-
-    @command("sgallowed", description="Show allowed devices", usage=".sgallowed")
-    async def sgallowed_cmd(self, event, args):
-        await event.edit(self.allowed_text(), parse_mode="html")
-
-    # -------------------- callbacks --------------------
+        state["enabled"] = False
+        self.save_state(state)
+        await event.edit("<b>SEC OFF set.</b> Auto-kick stopped.", parse_mode="html")
 
     async def refresh_callback(self, call):
         sessions = await self.get_sessions()
@@ -459,30 +352,14 @@ class SessionGuardDtgMod(Module):
             link_preview=False,
         )
 
-    async def info_callback(self, call, index: int):
-        if not self._last_sessions:
-            await self.get_sessions()
-        if index < 0 or index >= len(self._last_sessions):
-            await call.edit("Session not found.", reply_markup=None)
-            return
-        await call.edit(
-            self.detail_text(self._last_sessions[index]),
-            reply_markup=self.detail_buttons(index),
-            parse_mode="html",
-            link_preview=False,
-        )
-
     async def toggle_callback(self, call, index: int):
         if not self._last_sessions:
             await self.get_sessions()
         if index < 0 or index >= len(self._last_sessions):
             await call.edit("Session not found.", reply_markup=None)
             return
-        item = self._last_sessions[index]
-        if item.get("current"):
-            self.toggle_allowed(item)
-        else:
-            self.toggle_allowed(item)
+
+        self.toggle_policy(self._last_sessions[index])
         sessions = await self.get_sessions()
         await call.edit(
             self.sessions_text(sessions),
@@ -496,6 +373,10 @@ class SessionGuardDtgMod(Module):
         state["enabled"] = not bool(state.get("enabled"))
         self.save_state(state)
         self.start_task()
+
+        if state["enabled"]:
+            await self.scan_and_kick(notify=True)
+
         sessions = await self.get_sessions()
         await call.edit(
             self.sessions_text(sessions),
@@ -505,10 +386,11 @@ class SessionGuardDtgMod(Module):
         )
 
     async def kick_callback(self, call):
-        unknown, kicked = await self.scan_and_kick(notify=True)
+        targets, kicked = await self.scan_and_kick(notify=True, force_kick=True)
         sessions = await self.get_sessions()
         await call.edit(
-            f"<b>Kick complete.</b> Unknown: <code>{len(unknown)}</code> | Kicked: <code>{len(kicked)}</code>\n\n" + self.sessions_text(sessions),
+            f"<b>Manual kick done.</b> Targets: <code>{len(targets)}</code> | Kicked: <code>{len(kicked)}</code>\n\n"
+            + self.sessions_text(sessions),
             reply_markup=self.session_buttons(sessions),
             parse_mode="html",
             link_preview=False,

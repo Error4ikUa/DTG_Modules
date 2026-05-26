@@ -2,7 +2,7 @@
 # meta name: AutoProfile
 # meta description: Telegram profile automation: avatar rotate, photo set/delete, bio text and premium emoji status.
 # meta category: profile
-# meta version: 1.1.0
+# meta version: 1.1.1
 # meta author: DeathTerror
 # requires: pillow
 
@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from PIL import Image, ImageOps
 from telethon import functions, types, utils
-from telethon.errors import RPCError
+from telethon.errors import FloodWaitError, RPCError
 
 from deathtg.command import command
 from deathtg.loader import Module
@@ -38,7 +38,7 @@ class AutoProfileMod(Module):
         "title": "AutoProfile",
         "description": "Rotate avatar, set/delete profile photos, update bio and premium emoji status.",
         "category": "profile",
-        "version": "1.1.0",
+        "version": "1.1.1",
         "author": "DeathTerror",
         "commands": ".rotate, .rotateoff, .onprof, .dellprof, .desc, .prem, .premoff",
         "usage": ".rotate +15 60 | .rotateoff | .prem emoji [emoji...] [30] | .premoff",
@@ -55,6 +55,7 @@ class AutoProfileMod(Module):
         "rotate_photo_ids": [],
         "keep_rotated": 1,
         "rotate_size": 1024,
+        "rotate_flood_until": 0,
         "premium_enabled": False,
         "premium_emoji_ids": [],
         "premium_interval": 30,
@@ -93,6 +94,10 @@ class AutoProfileMod(Module):
 
     def save_state(self, state: dict) -> None:
         self.set("state", state)
+
+    def rotate_flood_left(self) -> int:
+        until = int(self.state().get("rotate_flood_until", 0) or 0)
+        return max(0, until - int(time.time()))
 
     def module_data_dir(self) -> Path:
         path = Path(__file__).resolve().parent / ".autoprofile"
@@ -261,6 +266,9 @@ class AutoProfileMod(Module):
     async def rotate_once(self) -> bool:
         async with self._rotate_lock:
             state = self.state()
+            if self.rotate_flood_left() > 0:
+                return False
+
             source = Path(str(state.get("rotate_source") or ""))
             if not source.exists():
                 current = await self.get_current_avatar_path()
@@ -271,8 +279,6 @@ class AutoProfileMod(Module):
                 state["rotate_source"] = str(source)
 
             angle = (int(state.get("rotate_angle", 0)) + int(state.get("rotate_step", 15))) % 360
-            state["rotate_angle"] = angle
-            self.save_state(state)
 
             rotated_path = None
             try:
@@ -285,9 +291,17 @@ class AutoProfileMod(Module):
                     ids.append(photo_id)
                     state["rotate_photo_ids"] = ids
                     state["last_rotated"] = str(photo_id)
-                    self.save_state(state)
+                state["rotate_angle"] = angle
+                state["rotate_flood_until"] = 0
+                self.save_state(state)
+                if photo_id:
                     await self.cleanup_rotated_history()
                 return True
+            except FloodWaitError as exc:
+                wait = int(getattr(exc, "seconds", 0) or getattr(exc, "value", 0) or 60)
+                state["rotate_flood_until"] = int(time.time()) + wait + 3
+                self.save_state(state)
+                return False
             finally:
                 self.cleanup(rotated_path)
 
@@ -384,7 +398,15 @@ class AutoProfileMod(Module):
         state["last_rotated"] = None
         self.save_state(state)
         self.start_rotate_task()
-        await self.rotate_once()
+        rotated = await self.rotate_once()
+        flood_left = self.rotate_flood_left()
+        if not rotated and flood_left:
+            await event.edit(
+                "<b>Avatar rotation enabled, but Telegram rate-limited profile photo upload.</b>\n"
+                f"AutoProfile will retry after: <code>{flood_left}</code> sec",
+                parse_mode="html",
+            )
+            return
         await event.edit(
             "<b>Avatar rotation enabled.</b>\n"
             f"Step: <code>{step}</code> deg\n"

@@ -2,7 +2,7 @@
 # meta name: AutoProfile
 # meta description: Telegram profile automation: avatar rotate, photo set/delete, bio text and premium emoji status.
 # meta category: profile
-# meta version: 1.1.1
+# meta version: 1.1.2
 # meta author: DeathTerror
 # requires: pillow
 
@@ -38,7 +38,7 @@ class AutoProfileMod(Module):
         "title": "AutoProfile",
         "description": "Rotate avatar, set/delete profile photos, update bio and premium emoji status.",
         "category": "profile",
-        "version": "1.1.1",
+        "version": "1.1.2",
         "author": "DeathTerror",
         "commands": ".rotate, .rotateoff, .onprof, .dellprof, .desc, .prem, .premoff",
         "usage": ".rotate +15 60 | .rotateoff | .prem emoji [emoji...] [30] | .premoff",
@@ -99,6 +99,23 @@ class AutoProfileMod(Module):
         until = int(self.state().get("rotate_flood_until", 0) or 0)
         return max(0, until - int(time.time()))
 
+    @staticmethod
+    def format_duration(seconds: int) -> str:
+        seconds = max(0, int(seconds or 0))
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        if seconds or not parts:
+            parts.append(f"{seconds}s")
+        return " ".join(parts[:3])
+
     def module_data_dir(self) -> Path:
         path = Path(__file__).resolve().parent / ".autoprofile"
         path.mkdir(parents=True, exist_ok=True)
@@ -123,6 +140,10 @@ class AutoProfileMod(Module):
                 state = self.state()
                 await asyncio.sleep(max(15, int(state.get("rotate_interval", 300) or 300)))
                 if state.get("rotate_enabled"):
+                    flood_left = self.rotate_flood_left()
+                    if flood_left > 0:
+                        await asyncio.sleep(min(max(30, flood_left), 300))
+                        continue
                     await self.rotate_once()
             except asyncio.CancelledError:
                 raise
@@ -403,7 +424,7 @@ class AutoProfileMod(Module):
         if not rotated and flood_left:
             await event.edit(
                 "<b>Avatar rotation enabled, but Telegram rate-limited profile photo upload.</b>\n"
-                f"AutoProfile will retry after: <code>{flood_left}</code> sec",
+                f"AutoProfile will retry after: <code>{self.format_duration(flood_left)}</code>",
                 parse_mode="html",
             )
             return
@@ -433,6 +454,16 @@ class AutoProfileMod(Module):
         try:
             await self.upload_profile_photo(path)
             await event.edit("<b>Profile photo uploaded.</b>\nOld photos were not deleted.", parse_mode="html")
+        except FloodWaitError as exc:
+            wait = int(getattr(exc, "seconds", 0) or getattr(exc, "value", 0) or 60)
+            state = self.state()
+            state["rotate_flood_until"] = int(time.time()) + wait + 3
+            self.save_state(state)
+            await event.edit(
+                "<b>Telegram rate-limited profile photo upload.</b>\n"
+                f"Try again after: <code>{self.format_duration(wait)}</code>",
+                parse_mode="html",
+            )
         except Exception as exc:
             await event.edit(f"<b>Failed:</b> <code>{self.esc(exc)}</code>", parse_mode="html")
         finally:

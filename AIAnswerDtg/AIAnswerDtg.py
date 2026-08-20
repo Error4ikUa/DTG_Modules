@@ -3,6 +3,7 @@
 # requires: aiohttp
 
 import asyncio
+import json
 import time
 from collections import defaultdict
 
@@ -20,6 +21,7 @@ FIRE = "🔥"
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/chat/completions"
 LIMIT_ERROR = "__AI_LIMIT_REACHED__"
+MAX_API_RESPONSE_BYTES = 1024 * 1024
 
 DEFAULT_TOXIC_PROMPT = (
     "Ты Telegram-автоответчик в стиле живого токсичного чела из чата. "
@@ -73,7 +75,8 @@ class AIAnswerDtgMod(loader.Module):
 
     def cfg(self):
         return self.db.get("AIAnswerDtg", "cfg", {
-            "token": "",
+            # Empty user-provided runtime setting; this is not a credential.
+            "token": "",  # nosec B105
             "prompt": DEFAULT_TOXIC_PROMPT,
             "model": "deepseek-v4-flash",
             "cooldown": 12,
@@ -113,6 +116,14 @@ class AIAnswerDtgMod(loader.Module):
             cfg["limit_reply"] = "иди нахуй"
         return cfg
 
+    @staticmethod
+    def memory_limit(cfg):
+        try:
+            value = int(cfg.get("max_memory", 8) or 8)
+        except (TypeError, ValueError):
+            value = 8
+        return max(1, min(value, 20))
+
     async def ask_ai(self, cfg, chat_id, user_text):
         cfg = self.normalize_cfg(cfg)
         token = cfg.get("token", "").strip()
@@ -121,12 +132,13 @@ class AIAnswerDtgMod(loader.Module):
 
         prompt = cfg.get("prompt") or DEFAULT_TOXIC_PROMPT
         model = cfg.get("model") or "deepseek-v4-flash"
-        history = self.memory[str(chat_id)][-int(cfg.get("max_memory", 8)):]
+        memory_limit = self.memory_limit(cfg)
+        history = self.memory[str(chat_id)][-memory_limit:]
 
         messages = [{"role": "system", "content": prompt}]
         for item in history:
             messages.append({"role": item["role"], "content": item["content"]})
-        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "user", "content": str(user_text)[:4000]})
 
         payload = {
             "model": model,
@@ -142,10 +154,18 @@ class AIAnswerDtgMod(loader.Module):
         }
 
         try:
-            timeout = aiohttp.ClientTimeout(total=45)
+            timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(DEEPSEEK_BASE_URL, json=payload, headers=headers) as resp:
-                    data = await resp.json(content_type=None)
+                    if resp.content_length and resp.content_length > MAX_API_RESPONSE_BYTES:
+                        return None, "DeepSeek вернул слишком большой ответ."
+                    raw = await resp.content.read(MAX_API_RESPONSE_BYTES + 1)
+                    if len(raw) > MAX_API_RESPONSE_BYTES:
+                        return None, "DeepSeek вернул слишком большой ответ."
+                    try:
+                        data = json.loads(raw.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        return None, f"DeepSeek вернул некорректный JSON ({resp.status})."
                     if resp.status >= 400:
                         err = data.get("error", {}) if isinstance(data, dict) else {}
                         msg = err.get("message") or str(data)[:500]
@@ -172,7 +192,7 @@ class AIAnswerDtgMod(loader.Module):
         mem = self.memory[str(chat_id)]
         mem.append({"role": "user", "content": user_text[:900]})
         mem.append({"role": "assistant", "content": text[:900]})
-        max_items = int(cfg.get("max_memory", 8)) * 2
+        max_items = memory_limit * 2
         if len(mem) > max_items:
             del mem[:-max_items]
 

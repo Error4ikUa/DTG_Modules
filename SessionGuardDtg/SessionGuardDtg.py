@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
+import logging
 import time
 from typing import Any
 
@@ -18,6 +20,8 @@ from telethon.errors import RPCError
 
 from deathtg.command import command
 from deathtg.loader import Module
+
+logger = logging.getLogger("deathtg.modules.SessionGuardDtg")
 
 
 class SessionGuardDtgMod(Module):
@@ -48,8 +52,12 @@ class SessionGuardDtgMod(Module):
         self._task: asyncio.Task | None = None
         self._last_sessions: list[dict] = []
         self._lock = asyncio.Lock()
+        self._owner_id = 0
 
     async def client_ready(self, client, db=None):
+        self.client = client
+        me = await client.get_me()
+        self._owner_id = int(getattr(me, "id", 0) or 0)
         if not self.get("state"):
             self.set("state", dict(self.DEFAULTS))
         self.start_task()
@@ -180,7 +188,21 @@ class SessionGuardDtgMod(Module):
     def should_kick(self, item: dict) -> bool:
         if item.get("current"):
             return False
-        return self.policy_for(item) != "allow"
+        # Unknown devices are reported first. A session is terminated only
+        # after the owner explicitly marks it as "kick" in the inline panel.
+        return self.policy_for(item) == "kick"
+
+    async def callback_allowed(self, call) -> bool:
+        actor_id = int(getattr(call, "sender_id", 0) or 0)
+        if actor_id and actor_id == self._owner_id:
+            return True
+        with_user = getattr(call, "from_user", None)
+        actor_id = int(getattr(with_user, "id", 0) or 0)
+        if actor_id == self._owner_id:
+            return True
+        with contextlib.suppress(Exception):
+            await call.answer("Owner only", show_alert=True)
+        return False
 
     def set_policy(self, session_hash: int, mode: str | None) -> None:
         state = self.state()
@@ -215,7 +237,7 @@ class SessionGuardDtgMod(Module):
         try:
             await self.client.send_message(chat_id, text, parse_mode="html")
         except Exception:
-            pass
+            logger.warning("Unable to deliver SessionGuard notification", exc_info=True)
 
     def policy_icon(self, item: dict) -> str:
         if item.get("current"):
@@ -344,6 +366,8 @@ class SessionGuardDtgMod(Module):
         await event.edit("<b>SEC OFF set.</b> Auto-kick stopped.", parse_mode="html")
 
     async def refresh_callback(self, call):
+        if not await self.callback_allowed(call):
+            return
         sessions = await self.get_sessions()
         await call.edit(
             self.sessions_text(sessions),
@@ -353,6 +377,8 @@ class SessionGuardDtgMod(Module):
         )
 
     async def toggle_callback(self, call, index: int):
+        if not await self.callback_allowed(call):
+            return
         if not self._last_sessions:
             await self.get_sessions()
         if index < 0 or index >= len(self._last_sessions):
@@ -369,6 +395,8 @@ class SessionGuardDtgMod(Module):
         )
 
     async def mode_callback(self, call):
+        if not await self.callback_allowed(call):
+            return
         state = self.state()
         state["enabled"] = not bool(state.get("enabled"))
         self.save_state(state)
@@ -386,6 +414,8 @@ class SessionGuardDtgMod(Module):
         )
 
     async def kick_callback(self, call):
+        if not await self.callback_allowed(call):
+            return
         targets, kicked = await self.scan_and_kick(notify=True, force_kick=True)
         sessions = await self.get_sessions()
         await call.edit(
@@ -397,4 +427,6 @@ class SessionGuardDtgMod(Module):
         )
 
     async def close_callback(self, call):
+        if not await self.callback_allowed(call):
+            return
         await call.edit("Closed.", reply_markup=None)

@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import html
+import ipaddress
 import logging
-import os
 import re
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from yt_dlp import YoutubeDL
 
@@ -28,10 +30,12 @@ logger = logging.getLogger("deathtg.modules.DownloaderDtg")
 YTDL_BASE = {
     "quiet": True,
     "no_warnings": True,
-    "nocheckcertificate": True,
+    "nocheckcertificate": False,
     "ignoreerrors": True,
-    "restrictfilenames": False,
+    "restrictfilenames": True,
     "noplaylist": True,
+    "socket_timeout": 30,
+    "max_filesize": 50 * 1024 * 1024,
     "http_headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     },
@@ -72,6 +76,25 @@ class DownloaderDtgMod(Module):
         return bool(re.match(r"https?://", str(text or ""), re.I))
 
     @staticmethod
+    def safe_media_url(text: str, allowed_domains: tuple[str, ...]) -> bool:
+        try:
+            parsed = urlparse(str(text or "").strip())
+            host = (parsed.hostname or "").rstrip(".").lower()
+            if parsed.scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
+                return False
+            if parsed.port not in {None, 80, 443}:
+                return False
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                address = None
+            if address and (not address.is_global or address.is_multicast):
+                return False
+            return any(host == domain or host.endswith(f".{domain}") for domain in allowed_domains)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
     def cleanup_path(path: str | Path | None) -> None:
         if not path:
             return
@@ -81,12 +104,9 @@ class DownloaderDtgMod(Module):
                 target.unlink()
             parent = target.parent
             if parent.exists() and parent.is_dir() and parent.name.startswith("dtg_downloader_"):
-                try:
-                    parent.rmdir()
-                except OSError:
-                    pass
-        except Exception:
-            pass
+                shutil.rmtree(parent, ignore_errors=True)
+        except (OSError, TypeError, ValueError):
+            logger.debug("Unable to clean downloader path %s", path, exc_info=True)
 
     async def reply_text(self, event) -> Optional[str]:
         try:
@@ -120,7 +140,7 @@ class DownloaderDtgMod(Module):
             with YoutubeDL({**YTDL_BASE, **opts}) as ydl:
                 return ydl.extract_info(target, download=download)
         try:
-            return await asyncio.to_thread(run)
+            return await asyncio.wait_for(asyncio.to_thread(run), timeout=180)
         except Exception as exc:
             logger.exception("yt-dlp failed for %s: %s", target, exc)
             return None
@@ -139,14 +159,22 @@ class DownloaderDtgMod(Module):
             }
         info = await self.ytdlp_extract(url, opts, download=True)
         if not info:
+            shutil.rmtree(workdir, ignore_errors=True)
             return None, None
         file_path = self.prepared_path(YoutubeDL({**YTDL_BASE, **opts}), info)
         if file_path and Path(file_path).exists():
+            if Path(file_path).stat().st_size > 50 * 1024 * 1024:
+                shutil.rmtree(workdir, ignore_errors=True)
+                return None, info
             return file_path, info
         files = [p for p in Path(workdir).glob("*") if p.is_file()]
         if files:
             newest = max(files, key=lambda p: p.stat().st_mtime)
+            if newest.stat().st_size > 50 * 1024 * 1024:
+                shutil.rmtree(workdir, ignore_errors=True)
+                return None, info
             return str(newest), info
+        shutil.rmtree(workdir, ignore_errors=True)
         return None, info
 
     async def send_downloaded(self, client, chat_id, url: str, media_type: str, with_caption: bool = True) -> bool:
@@ -228,13 +256,16 @@ class DownloaderDtgMod(Module):
             return
 
         if self.is_url(query):
+            if not self.safe_media_url(query, ("soundcloud.com",)):
+                await self.set_status(event, "<b>Only public SoundCloud links are allowed.</b>")
+                return
             await self.set_status(event, "<b>Downloading SoundCloud track...</b>")
             ok = await self.send_downloaded(event.client, event.chat_id, query, "audio")
             if ok:
                 try:
                     await event.delete()
                 except Exception:
-                    pass
+                    logger.debug("Unable to delete completed SoundCloud command", exc_info=True)
             else:
                 await self.set_status(event, "<b>SoundCloud download failed.</b>")
             return
@@ -262,7 +293,7 @@ class DownloaderDtgMod(Module):
             await call.edit("Session expired.", reply_markup=None)
             return
         url = tracks[index].get("url")
-        if not url:
+        if not url or not self.safe_media_url(str(url), ("soundcloud.com",)):
             await call.edit("Track URL not found.", reply_markup=None)
             return
         await call.edit("<b>Downloading...</b>", reply_markup=None, parse_mode="html")
@@ -279,7 +310,7 @@ class DownloaderDtgMod(Module):
         if not url:
             await self.set_status(event, "<b>Usage:</b> <code>.tt tiktok link</code>")
             return
-        if "tiktok.com" not in url:
+        if not self.safe_media_url(url, ("tiktok.com",)):
             await self.set_status(event, "<b>Unsupported TikTok link.</b>")
             return
         await self.set_status(event, "<b>Downloading TikTok...</b>")
@@ -288,7 +319,7 @@ class DownloaderDtgMod(Module):
             try:
                 await event.delete()
             except Exception:
-                pass
+                logger.debug("Unable to delete completed TikTok command", exc_info=True)
         else:
             await self.set_status(event, "<b>TikTok download failed.</b>")
 
@@ -298,7 +329,7 @@ class DownloaderDtgMod(Module):
         if not url:
             await self.set_status(event, "<b>Usage:</b> <code>.yt youtube link</code>")
             return
-        if "youtube.com" not in url and "youtu.be" not in url:
+        if not self.safe_media_url(url, ("youtube.com", "youtu.be")):
             await self.set_status(event, "<b>Unsupported YouTube link.</b>")
             return
         await self.set_status(event, "<b>Downloading YouTube...</b>")
@@ -307,7 +338,7 @@ class DownloaderDtgMod(Module):
             try:
                 await event.delete()
             except Exception:
-                pass
+                logger.debug("Unable to delete completed YouTube command", exc_info=True)
         else:
             await self.set_status(event, "<b>YouTube download failed.</b>")
 

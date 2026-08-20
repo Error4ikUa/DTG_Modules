@@ -3,6 +3,7 @@
 # requires: telethon
 
 import asyncio
+import logging
 import re
 import time
 from collections import defaultdict, deque
@@ -13,6 +14,8 @@ from telethon.tl.functions.messages import EditChatDefaultBannedRightsRequest
 from telethon.tl.types import ChatAdminRights, ChatBannedRights
 
 from .. import loader, utils
+
+logger = logging.getLogger("deathtg.modules.AdminToolsDtg")
 
 BLUE = "🔵"
 OK = "🔷"
@@ -101,6 +104,18 @@ class AdminToolsDtgMod(loader.Module):
     async def client_ready(self, client, db):
         self.client = client
         self.db = db
+        me = await client.get_me()
+        self.owner_id = int(getattr(me, "id", 0) or 0)
+
+    async def owner_callback(self, call, expected_owner: int) -> bool:
+        actor_id = int(getattr(call, "sender_id", 0) or 0)
+        if actor_id == int(expected_owner) == self.owner_id:
+            return True
+        try:
+            await call.answer("Только владелец панели", show_alert=True)
+        except Exception:
+            logger.debug("Unable to show owner-only callback alert", exc_info=True)
+        return False
 
     def cfg(self):
         return self.db.get("AdminToolsDtg", "cfg", {"antispam": {}, "limit": 5, "window": 7, "mute": 600, "warn_limit": 3})
@@ -451,23 +466,27 @@ class AdminToolsDtgMod(loader.Module):
         enabled = cfg.get("antispam", {}).get(str(message.chat_id), False)
         text = f"{SHIELD} <b>AdminToolsDtg Panel</b>\n\n{BLUE} <b>Чат:</b> <code>{message.chat_id}</code>\n{BLUE} <b>Антиспам:</b> <code>{'on' if enabled else 'off'}</code>\n{INFO} <b>Быстрые действия ниже.</b>"
         markup = [
-            [{"text": "🔵 Antispam ON", "callback": self.panel_antispam, "args": (message.chat_id, True)}, {"text": "⚪ Antispam OFF", "callback": self.panel_antispam, "args": (message.chat_id, False)}],
-            [{"text": "🛡️ Lock chat", "callback": self.panel_lock, "args": (message.chat_id, True)}, {"text": "🔷 Unlock chat", "callback": self.panel_lock, "args": (message.chat_id, False)}],
-            [{"text": "💎 Status", "callback": self.panel_status, "args": (message.chat_id,)}],
+            [{"text": "🔵 Antispam ON", "callback": self.panel_antispam, "args": (message.chat_id, True, message.sender_id)}, {"text": "⚪ Antispam OFF", "callback": self.panel_antispam, "args": (message.chat_id, False, message.sender_id)}],
+            [{"text": "🛡️ Lock chat", "callback": self.panel_lock, "args": (message.chat_id, True, message.sender_id)}, {"text": "🔷 Unlock chat", "callback": self.panel_lock, "args": (message.chat_id, False, message.sender_id)}],
+            [{"text": "💎 Status", "callback": self.panel_status, "args": (message.chat_id, message.sender_id)}],
         ]
         try:
             await self.inline.form(text, message=message, reply_markup=markup, ttl=3600)
         except Exception as e:
             await utils.answer(message, f"{BLUE} <b>Инлайн недоступен:</b> <code>{utils.escape_html(str(e))}</code>")
 
-    async def panel_antispam(self, call, chat_id, state):
+    async def panel_antispam(self, call, chat_id, state, expected_owner):
+        if not await self.owner_callback(call, expected_owner):
+            return
         cfg = self.cfg()
         cfg.setdefault("antispam", {})[str(chat_id)] = state
         self.save_cfg(cfg)
         await call.answer(f"Антиспам {'включён' if state else 'выключен'}", show_alert=False)
         await call.edit(f"{OK} <b>Антиспам {'включён' if state else 'выключен'}.</b>")
 
-    async def panel_lock(self, call, chat_id, locked):
+    async def panel_lock(self, call, chat_id, locked, expected_owner):
+        if not await self.owner_callback(call, expected_owner):
+            return
         try:
             await self.client(EditChatDefaultBannedRightsRequest(chat_id, ChatBannedRights(until_date=None, send_messages=locked)))
             await call.answer("Готово", show_alert=False)
@@ -475,7 +494,9 @@ class AdminToolsDtgMod(loader.Module):
         except Exception as e:
             await call.answer(str(e), show_alert=True)
 
-    async def panel_status(self, call, chat_id):
+    async def panel_status(self, call, chat_id, expected_owner):
+        if not await self.owner_callback(call, expected_owner):
+            return
         cfg = self.cfg()
         enabled = cfg.get("antispam", {}).get(str(chat_id), False)
         await call.answer("Статус обновлён", show_alert=False)
@@ -501,6 +522,6 @@ class AdminToolsDtgMod(loader.Module):
                 await self.client(EditBannedRequest(message.chat_id, message.sender_id, self.mute_rights(t + mute)))
                 await message.respond(f"{BLUE} <b>Антиспам сработал.</b>\n{CLOCK} <b>Мут на {human(mute)}.</b>")
             except (ChatAdminRequiredError, UserAdminInvalidError, UserNotParticipantError):
-                pass
+                logger.debug("Antispam cannot mute user in chat %s", message.chat_id)
             except Exception:
-                pass
+                logger.exception("Antispam mute failed in chat %s", message.chat_id)

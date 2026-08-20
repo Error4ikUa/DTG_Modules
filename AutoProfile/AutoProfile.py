@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
 import tempfile
 import time
 from pathlib import Path
@@ -21,6 +22,8 @@ from telethon.errors import FloodWaitError, RPCError
 
 from deathtg.command import command
 from deathtg.loader import Module
+
+logger = logging.getLogger("deathtg.modules.AutoProfile")
 
 try:
     RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
@@ -182,8 +185,8 @@ class AutoProfileMod(Module):
             try:
                 if path and Path(path).exists():
                     Path(path).unlink()
-            except Exception:
-                pass
+            except OSError:
+                logger.debug("Unable to remove temporary profile image %s", path, exc_info=True)
 
     async def get_reply_photo_path(self, event) -> Optional[Path]:
         reply = await event.get_reply_message()
@@ -272,7 +275,7 @@ class AutoProfileMod(Module):
         interval = int(parts[1])
         if step == 0:
             raise ValueError("angle_zero")
-        return step, max(15, interval)
+        return step, max(300, interval)
 
     def rotate_image(self, source: Path, angle: int) -> Path:
         out = self.tmp_path(".jpg")
@@ -394,7 +397,7 @@ class AutoProfileMod(Module):
         except Exception:
             await event.edit(
                 "<b>Usage:</b> <code>.rotate +15 300</code>\n"
-                "Angle can be positive or negative. Timer is seconds, minimum 15.",
+                "Angle can be positive or negative. Timer is seconds, minimum 300.",
                 parse_mode="html",
             )
             return

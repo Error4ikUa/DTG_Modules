@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import html
 import json
+import logging
+import os
 import time
 from pathlib import Path
 
 from deathtg.loader import Module
 from deathtg.command import command
+
+logger = logging.getLogger("deathtg.modules.NoteDtg")
+MAX_NOTES = 500
 
 
 class NoteDtgMod(Module):
@@ -37,15 +42,25 @@ class NoteDtgMod(Module):
             if self.config_path.exists():
                 data = json.loads(self.config_path.read_text(encoding="utf-8"))
                 return data if isinstance(data, dict) else {}
-        except Exception:
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Unable to load notes from %s: %s", self.config_path, exc)
             return {}
         return {}
 
-    def save_notes(self, notes: dict) -> None:
+    def save_notes(self, notes: dict) -> bool:
+        temporary = self.config_path.with_suffix(f"{self.config_path.suffix}.tmp")
         try:
-            self.config_path.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, self.config_path)
+            return True
+        except OSError as exc:
+            logger.error("Unable to save notes to %s: %s", self.config_path, exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Unable to remove temporary notes file", exc_info=True)
+            return False
 
     @staticmethod
     def args_text(args) -> str:
@@ -118,9 +133,14 @@ class NoteDtgMod(Module):
             return
         notes = self.load_notes()
         key = self.note_key(name)
+        if key not in notes and len(notes) >= MAX_NOTES:
+            await event.edit(f"<b>Note limit reached:</b> <code>{MAX_NOTES}</code>", parse_mode="html")
+            return
         old = notes.get(key, {})
         notes[key] = {"name": name, "text": text[:6000], "created": int(old.get("created") or time.time()), "updated": int(time.time())}
-        self.save_notes(notes)
+        if not self.save_notes(notes):
+            await event.edit("<b>Could not save the note.</b> Check DeathTG logs.", parse_mode="html")
+            return
         await event.edit(f"<b>Saved note:</b> <code>{self.esc(name)}</code>", parse_mode="html")
 
     @command("note", description="Open notes menu", usage=".note")
@@ -151,7 +171,9 @@ class NoteDtgMod(Module):
     async def remove_callback(self, call, key: str):
         notes = self.load_notes()
         notes.pop(key, None)
-        self.save_notes(notes)
+        if not self.save_notes(notes):
+            await call.edit("<b>Could not update notes.</b> Check DeathTG logs.", reply_markup=None, parse_mode="html")
+            return
         await call.edit("<b>Removed.</b>\n\n" + self.menu_text(notes), reply_markup=self.menu_buttons(notes), parse_mode="html", link_preview=False)
 
     async def close_callback(self, call):

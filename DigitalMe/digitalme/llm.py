@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from .database import DigitalMeDatabase
+from .local_replies import quick_reply, reject_model_reply
 from .memory import MemoryEvaluator
 from .prompt_builder import PromptBuilder
 from .providers import ProviderError, ProviderRouter
@@ -40,6 +41,9 @@ class GenerationEngine:
 
     async def generate(self, item: QueueItem, *, thinking_override: bool | None = None) -> GenerationResult | None:
         current_text = "\n".join(bubble.text for bubble in item.messages)
+        local = quick_reply(current_text, owner_name=str(self.config_get("owner_name", "Вова") or "Вова"))
+        if local:
+            return GenerationResult(messages=[GeneratedBubble(local, delay_ms=250)])
         if is_credential_request(current_text):
             # Credentials are never supplied, reconstructed, or sent to the provider.
             return GenerationResult(messages=[GeneratedBubble("не помню, глянь в избранном", delay_ms=250)])
@@ -89,7 +93,12 @@ class GenerationEngine:
             completion = await self._complete_with_recovery(prompt, item, thinking_override=thinking_override)
         self.last_completion = completion
         result = await self._parse_completion(completion.content, item)
-        if result is None or needs_style_retry(result):
+        recent_owner_texts = [
+            str(message.get("text") or "")
+            for message in recent
+            if int(message.get("sender_id") or 0) == self.owner_id
+        ]
+        if result is None or needs_style_retry(result) or self._reject_result(result, current_text, recent_owner_texts):
             correction = [
                 *prompt,
                 {"role": "assistant", "content": completion.content},
@@ -98,9 +107,16 @@ class GenerationEngine:
             completion = await self._complete_with_recovery(correction, item, thinking_override=False)
             self.last_completion = completion
             result = await self._parse_completion(completion.content, item)
-        if needs_style_retry(result):
+        if needs_style_retry(result) or self._reject_result(result, current_text, recent_owner_texts):
             return None
         return result
+
+    @staticmethod
+    def _reject_result(result: GenerationResult | None, incoming: str, recent_owner_texts: list[str]) -> bool:
+        return not result or any(
+            reject_model_reply(message.text, incoming=incoming, recent_owner_texts=recent_owner_texts)
+            for message in result.messages
+        )
 
     async def _parse_completion(self, content: str, item: QueueItem) -> GenerationResult | None:
         reply_ids = {bubble.message_id for bubble in item.messages if bubble.message_id is not None}

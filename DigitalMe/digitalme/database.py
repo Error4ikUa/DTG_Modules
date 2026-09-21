@@ -436,6 +436,14 @@ class DigitalMeDatabase:
             row = await self._fetchone("SELECT COUNT(*) AS count FROM messages WHERE sender_id = ?", (owner_id,))
         return int(row["count"] if row else 0)
 
+    async def purge_generated_messages(self) -> int:
+        """Remove only prior DigitalMe output from local conversation context."""
+        async def operation() -> int:
+            cursor = await self.conn.execute("DELETE FROM messages WHERE message_type = 'digitalme_generated'")
+            return int(cursor.rowcount or 0)
+
+        return int(await self._write(operation) or 0)
+
     async def clear_examples_and_rag(self) -> None:
         async def operation() -> None:
             if self.fts_enabled:

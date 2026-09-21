@@ -66,6 +66,7 @@ class DigitalMeMod(Module):
             ConfigValue("enable_thinking", False, "Use a provider-native thinking mode when it is supported", validators.Boolean()),
             ConfigValue("api_key", "", "Remote provider API key", validators.String(max_len=1000), secret=True),
             ConfigValue("model", "runeweaver", "Primary model", validators.String(min_len=1, max_len=200)),
+            ConfigValue("owner_name", "Вова", "Name used for direct identity questions", validators.String(min_len=1, max_len=80)),
             ConfigValue("fallback_models", "", "Comma-separated fallback model IDs", validators.String(max_len=1000)),
             ConfigValue("temperature", 0.55, "Sampling temperature", _float_validator(0.0, 2.0)),
             ConfigValue("top_p", 0.9, "Top-p sampling", _float_validator(0.0, 1.0)),
@@ -83,7 +84,7 @@ class DigitalMeMod(Module):
             ConfigValue("retrieval_first", True, "Use matching past turns before full AI generation", validators.Boolean()),
             ConfigValue("retrieval_candidate_limit", 4, "Past reply patterns supplied to fast generation", validators.Integer(minimum=1, maximum=8)),
             ConfigValue("fast_reply_max_tokens", 80, "Fast reply generation token budget", validators.Integer(minimum=64, maximum=256)),
-            ConfigValue("max_message_bubbles", 1, "Maximum reply bubbles", validators.Integer(minimum=1, maximum=12)),
+            ConfigValue("max_message_bubbles", 3, "Maximum reply bubbles", validators.Integer(minimum=1, maximum=12)),
             ConfigValue("max_message_length", 280, "Maximum bubble length", validators.Integer(minimum=32, maximum=4096)),
             ConfigValue("max_style_length_multiplier", 3.0, "Maximum length relative to observed owner style", _float_validator(1.0, 8.0)),
             ConfigValue("strict_style_mode", True, "Keep replies short and block roleplay actions", validators.Boolean()),
@@ -618,9 +619,8 @@ class DigitalMeMod(Module):
         for index, bubble in enumerate(result.messages):
             if index:
                 await asyncio.sleep(max(0, bubble.delay_ms) / 1000)
-            reply_to = bubble.reply_to_message_id
-            if reply_to is None and index == 0 and item.messages:
-                reply_to = item.messages[-1].message_id
+            # A normal conversation continues in the chat; automatic reply cards reveal the automation.
+            reply_to = None
             try:
                 self._remember_generated(item.chat_id, bubble.text)
                 sent = await self.client.send_message(item.chat_id, bubble.text, reply_to=reply_to)

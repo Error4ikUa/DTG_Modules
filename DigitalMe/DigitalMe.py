@@ -594,6 +594,7 @@ class DigitalMeMod(Module):
                 text=bubble.text,
                 reply_to_message_id=reply_to,
                 display_name=str(dialog.get("display_name") or ""),
+                message_type="digitalme_generated",
             )
         await refresh_rolling_summary(
             self._database,

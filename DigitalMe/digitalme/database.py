@@ -364,6 +364,7 @@ class DigitalMeDatabase:
         text: str,
         reply_to_message_id: int | None,
         display_name: str = "",
+        message_type: str = "message",
     ) -> None:
         record = {
             "chat_id": chat_id,
@@ -375,6 +376,7 @@ class DigitalMeDatabase:
             "timestamp": timestamp,
             "text": text,
             "reply_to_message_id": reply_to_message_id,
+            "message_type": message_type,
         }
         await self.insert_import_batch([record])
 
@@ -391,6 +393,7 @@ class DigitalMeDatabase:
         *,
         chat_id: int | None = None,
         sender_id: int | None = None,
+        exclude_generated: bool = False,
         batch_size: int = 500,
     ) -> AsyncIterator[dict[str, Any]]:
         last_timestamp = -1.0
@@ -404,8 +407,10 @@ class DigitalMeDatabase:
             if sender_id is not None:
                 clauses.append("sender_id = ?")
                 params.append(int(sender_id))
+            if exclude_generated:
+                clauses.append("message_type != 'digitalme_generated'")
             rows = await self._fetchall(
-                "SELECT id, chat_id, sender_id, message_id, timestamp, text, reply_to_message_id "
+                "SELECT id, chat_id, sender_id, message_id, timestamp, text, reply_to_message_id, message_type "
                 "FROM messages WHERE " + " AND ".join(clauses) + " ORDER BY timestamp, id LIMIT ?",
                 tuple(params + [batch_size]),
             )

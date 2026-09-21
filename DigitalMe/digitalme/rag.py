@@ -24,7 +24,6 @@ class RAGService:
 
     async def rebuild_documents(self, progress_callback=None) -> int:
         await self.database.clear_rag_documents()
-        display_names = await self.database.dialog_display_names()
         batch: list[dict[str, Any]] = []
         count = 0
         async for example in self.database.iter_examples():
@@ -37,7 +36,6 @@ class RAGService:
             # Raw messages remain in the local archive, but secrets must never become retrievable prompt context.
             if self.sanitizer.contains_sensitive(content):
                 continue
-            content = self.sanitizer.anonymize_style_example(content, names=display_names)
             batch.append(
                 {
                     "source_example_id": int(example["id"]),
@@ -89,33 +87,13 @@ class RAGService:
         limit: int,
     ) -> list[dict[str, Any]]:
         same_chat_only = not bool(self.config_get("cross_contact_style_examples", False))
-        selected = await self._search_scope(
+        return await self._search_scope(
             query,
             chat_id=chat_id,
             contact_id=contact_id,
             same_chat_only=same_chat_only,
             limit=limit,
         )
-        # A new chat has no local examples. In that case use only anonymized owner-style
-        # patterns, never another contact's factual history or recent conversation.
-        if same_chat_only and len(selected) < max(1, limit):
-            global_examples = await self._search_scope(
-                query,
-                chat_id=chat_id,
-                contact_id=contact_id,
-                same_chat_only=False,
-                limit=limit,
-            )
-            seen = {int(item["id"]) for item in selected}
-            for example in global_examples:
-                if int(example["id"]) in seen:
-                    continue
-                example["content"] = self.sanitizer.anonymize_style_example(str(example.get("content") or ""))
-                selected.append(example)
-                seen.add(int(example["id"]))
-                if len(selected) >= max(1, limit):
-                    break
-        return selected[: max(1, limit)]
 
     async def _search_scope(
         self,

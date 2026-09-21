@@ -7,7 +7,15 @@ from .memory import MemoryEvaluator
 from .prompt_builder import PromptBuilder
 from .providers import ProviderError, ProviderRouter
 from .rag import RAGService
-from .schemas import GenerationResult, QueueItem, needs_style_retry, parse_generation_response
+from .schemas import (
+    GeneratedBubble,
+    GenerationResult,
+    QueueItem,
+    is_automation_probe,
+    is_credential_request,
+    needs_style_retry,
+    parse_generation_response,
+)
 
 
 class GenerationEngine:
@@ -32,16 +40,21 @@ class GenerationEngine:
 
     async def generate(self, item: QueueItem, *, thinking_override: bool | None = None) -> GenerationResult | None:
         current_text = "\n".join(bubble.text for bubble in item.messages)
+        if is_credential_request(current_text):
+            # Credentials are never supplied, reconstructed, or sent to the provider.
+            return GenerationResult(messages=[GeneratedBubble("не помню, глянь в избранном", delay_ms=250)])
+        if is_automation_probe(current_text):
+            return GenerationResult(messages=[GeneratedBubble("сам ты ии", delay_ms=250)])
         recent_limit = self._int("recent_messages_limit", 40, 6, 100)
         recent = await self.database.get_recent_messages(item.chat_id, recent_limit)
         personality = await self.database.get_personality_profile(self.owner_id)
         relationship = await self.database.get_relationship_profile(item.sender_id)
         candidates = []
-        if bool(self.config_get("retrieval_first", True)):
+        if bool(self.config_get("retrieval_first", False)):
             candidates = await self.database.find_reply_candidates(
                 chat_id=item.chat_id,
                 incoming=current_text,
-                limit=self._int("retrieval_candidate_limit", 4, 1, 8),
+                limit=min(2, self._int("retrieval_candidate_limit", 2, 1, 8)),
             )
         if candidates:
             prompt = self.prompt_builder.build_retrieval_reply(
@@ -76,15 +89,17 @@ class GenerationEngine:
             completion = await self._complete_with_recovery(prompt, item, thinking_override=thinking_override)
         self.last_completion = completion
         result = await self._parse_completion(completion.content, item)
-        if needs_style_retry(result):
+        if result is None or needs_style_retry(result):
             correction = [
                 *prompt,
                 {"role": "assistant", "content": completion.content},
-                {"role": "user", "content": "Перепиши. Слишком похоже на AI. Коротко, без вежливых шаблонов и без действий в звёздочках. Верни только JSON."},
+                {"role": "user", "content": "Перепиши ответ с нуля. Нужен нормальный короткий ответ по смыслу текущего сообщения. Не повторяй прошлые фразы, не пиши JSON внутри text, <PERSON>, эмодзи-спам, действия или признания про AI. Верни только валидный JSON."},
             ]
             completion = await self._complete_with_recovery(correction, item, thinking_override=False)
             self.last_completion = completion
             result = await self._parse_completion(completion.content, item)
+        if needs_style_retry(result):
+            return None
         return result
 
     async def _parse_completion(self, content: str, item: QueueItem) -> GenerationResult | None:

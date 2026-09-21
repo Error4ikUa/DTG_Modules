@@ -99,7 +99,7 @@ async def rebuild_conversation_examples(
     for position, chat_id in enumerate(chat_ids, start=1):
         grouper = TurnGrouper(owner_id=owner_id, chat_id=chat_id, contact_id=chat_id, gap_seconds=gap_seconds)
         batch: list[dict[str, Any]] = []
-        async for message in database.iter_messages(chat_id=chat_id):
+        async for message in database.iter_messages(chat_id=chat_id, exclude_generated=True):
             completed = grouper.push(message)
             if completed:
                 batch.append(completed)
@@ -181,7 +181,7 @@ async def build_personality_profile(database: DigitalMeDatabase, *, owner_id: in
     uppercase_messages = 0
     total_messages = 0
 
-    async for row in database.iter_messages(sender_id=owner_id):
+    async for row in database.iter_messages(sender_id=owner_id, exclude_generated=True):
         text = clean_text(row.get("text"))
         if not text:
             continue
@@ -239,7 +239,7 @@ async def _profile_for_chat(database: DigitalMeDatabase, *, chat_id: int, owner_
     teasing_hits = 0
     profanity_hits = 0
     language_mix: Counter[str] = Counter()
-    async for row in database.iter_messages(chat_id=chat_id):
+    async for row in database.iter_messages(chat_id=chat_id, exclude_generated=True):
         total_count += 1
         if row.get("sender_id") != owner_id:
             continue

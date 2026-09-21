@@ -19,6 +19,20 @@ GENERIC_ASSISTANT_RE = re.compile(
     r"чем могу помочь|давайте разбер[её]мся|могу предложить|я постараюсь|мне очень жаль|как делишки)\b",
     re.IGNORECASE,
 )
+PLACEHOLDER_RE = re.compile(r"<[^>\r\n]{1,100}>")
+STRUCTURED_OUTPUT_RE = re.compile(r"[\[{]\s*\"?(?:messages|text|memory_candidates)\"?\s*[:\"]", re.IGNORECASE)
+REPEATED_CHARACTER_RE = re.compile(r"([A-Za-zА-Яа-яЁё])\1{10,}")
+AUTOMATION_ADMISSION_RE = re.compile(
+    r"\b(?:я\s+(?:являюсь\s+)?(?:бот(?:ом)?|ии|ai|нейросетью|моделью|программой|искусственным\s+интеллектом)|"
+    r"это\s+(?:бот|ии|ai|нейросеть|digitalme)|digitalme)\b",
+    re.IGNORECASE,
+)
+AUTOMATION_PROBE_RE = re.compile(r"\b(?:ты|вы)\s+(?:бот|ии|ai|нейросеть|модель|программа)\b", re.IGNORECASE)
+CREDENTIAL_REQUEST_RE = re.compile(
+    r"\b(?:парол\w*|pass(?:word|code)?|токен\w*|token\w*|api[_ -]?key|сесси\w*|"
+    r"код(?:\s+(?:подтверждения|входа|из\s+смс))?|2fa|otp)\b",
+    re.IGNORECASE,
+)
 
 
 def _clean_generated_text(value: Any, *, limit: int) -> str:
@@ -26,11 +40,33 @@ def _clean_generated_text(value: Any, *, limit: int) -> str:
     return clean_text(ROLEPLAY_ACTION_PREFIX_RE.sub("", clean_text(value, limit=limit)), limit=limit)
 
 
+def is_unsafe_generated_text(text: str) -> bool:
+    """Reject model transport artifacts and obvious loops before they reach Telegram."""
+    value = clean_text(text, limit=4096)
+    letters = "".join(char.lower() for char in value if char.isalpha())
+    low_diversity_loop = len(letters) >= 32 and len(set(letters)) <= 3
+    return bool(
+        PLACEHOLDER_RE.search(value)
+        or STRUCTURED_OUTPUT_RE.search(value)
+        or REPEATED_CHARACTER_RE.search(value)
+        or low_diversity_loop
+        or AUTOMATION_ADMISSION_RE.search(value)
+    )
+
+
+def is_credential_request(text: str) -> bool:
+    return bool(CREDENTIAL_REQUEST_RE.search(clean_text(text, limit=2000)))
+
+
+def is_automation_probe(text: str) -> bool:
+    return bool(AUTOMATION_PROBE_RE.search(clean_text(text, limit=2000)))
+
+
 def needs_style_retry(result: GenerationResult | None) -> bool:
     if not result:
         return False
     text = "\n".join(message.text for message in result.messages)
-    return bool(ROLEPLAY_ACTION_RE.search(text) or GENERIC_ASSISTANT_RE.search(text))
+    return bool(ROLEPLAY_ACTION_RE.search(text) or GENERIC_ASSISTANT_RE.search(text) or is_unsafe_generated_text(text))
 
 
 @dataclass(slots=True)
@@ -110,7 +146,7 @@ def parse_generation_response(
     parsed = _decode_object(raw)
     if parsed is None:
         fallback = _clean_generated_text(raw, limit=max_message_length)
-        if REASONING_MARKER_RE.search(fallback):
+        if REASONING_MARKER_RE.search(fallback) or is_unsafe_generated_text(fallback):
             return None
         return GenerationResult([GeneratedBubble(fallback)]) if fallback else None
 
@@ -123,7 +159,7 @@ def parse_generation_response(
         if not isinstance(value, dict):
             continue
         text = _clean_generated_text(value.get("text"), limit=max_message_length)
-        if not text:
+        if not text or is_unsafe_generated_text(text):
             continue
         raw_delay = value.get("delay_ms", 0)
         try:

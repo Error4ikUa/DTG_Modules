@@ -89,15 +89,15 @@ class PromptBuilder:
             for item in memories
         ]
         sections = [
-            ("Personality statistics", json_dumps(personality_view), 2400),
-            ("Relationship profile for this chat only", json_dumps(relationship_view), 2200),
-            ("Rolling summary for this chat only", json_dumps(summary), 1600),
-            ("Allowed factual memories for this chat only", json_dumps(facts), 1700),
-            ("Style examples", "\n\n".join(examples), 5200),
-            ("Recent conversation for this chat only", json_dumps(recent), 6000),
+            ("Personality statistics", json_dumps(personality_view), 1200 if strict_style else 2400),
+            ("Relationship profile for this chat only", json_dumps(relationship_view), 1000 if strict_style else 2200),
+            ("Rolling summary for this chat only", json_dumps(summary), 700 if strict_style else 1600),
+            ("Allowed factual memories for this chat only", json_dumps(facts), 800 if strict_style else 1700),
+            ("Style examples", "\n\n".join(examples), 1600 if strict_style else 5200),
+            ("Recent conversation for this chat only", json_dumps(recent), 2200 if strict_style else 6000),
             ("Current incoming Telegram bubbles", json_dumps(current), 3000),
         ]
-        budget = self._int("context_window_override", 8192, 2048, 131072) - self._int("max_output_tokens", 1000, 64, 8192)
+        budget = self._int("context_window_override", 4096, 2048, 131072) - self._int("max_output_tokens", 160, 64, 8192)
         body = self._fit_sections(sections, max(1200, budget))
         if bool(self.config_get("sanitize_cloud_prompts", True)) and str(self.config_get("provider", "ollama")).lower() != "ollama":
             body = self.sanitizer.sanitize(body)

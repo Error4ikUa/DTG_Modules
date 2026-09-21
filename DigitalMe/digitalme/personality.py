@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .database import DigitalMeDatabase
-from .utils import clean_text, compact_lines, tokenize
+from .utils import clean_text, compact_lines, json_loads, reply_key, tokenize
 
 
 EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF]", re.UNICODE)
@@ -116,6 +116,39 @@ async def rebuild_conversation_examples(
         if progress_callback:
             await progress_callback({"phase": "building_turns", "current": position, "total": len(chat_ids), "examples": total})
     return total
+
+
+async def rebuild_reply_patterns(database: DigitalMeDatabase) -> int:
+    """Build a compact same-chat index of historical incoming-to-owner turns."""
+    patterns: list[dict[str, Any]] = []
+    async for example in database.iter_examples():
+        context = example.get("context_json")
+        responses = example.get("response_json")
+        if not isinstance(context, str) or not isinstance(responses, str):
+            continue
+        incoming_messages = json_loads(context, [])
+        owner_responses = json_loads(responses, [])
+        if not isinstance(incoming_messages, list) or not isinstance(owner_responses, list):
+            continue
+        incoming = clean_text(incoming_messages[-1] if incoming_messages else "", limit=500)
+        reply_parts = [clean_text(item, limit=280) for item in owner_responses]
+        reply_parts = [item for item in reply_parts if item]
+        key = reply_key(incoming)
+        response_text = "\n".join(reply_parts)
+        if not key or not response_text or len(response_text) > 560:
+            continue
+        patterns.append(
+            {
+                "chat_id": int(example["chat_id"]),
+                "input_key": key,
+                "input_text": incoming,
+                "responses": reply_parts[:3],
+                "response_text": response_text,
+                "timestamp": float(example.get("timestamp") or 0.0),
+            }
+        )
+    await database.replace_reply_patterns(patterns)
+    return len(patterns)
 
 
 def _language_label(text: str) -> str:

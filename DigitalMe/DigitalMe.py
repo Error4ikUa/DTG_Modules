@@ -25,6 +25,7 @@ from .digitalme.personality import (
     build_personality_profile,
     rebuild_all_summaries,
     rebuild_conversation_examples,
+    rebuild_reply_patterns,
     rebuild_relationship_profiles,
     refresh_rolling_summary,
 )
@@ -70,6 +71,7 @@ class DigitalMeMod(Module):
             ConfigValue("top_p", 0.9, "Top-p sampling", _float_validator(0.0, 1.0)),
             ConfigValue("max_output_tokens", 160, "Maximum completion tokens", validators.Integer(minimum=64, maximum=8192)),
             ConfigValue("timeout_seconds", 60, "Provider timeout", validators.Integer(minimum=5, maximum=300)),
+            ConfigValue("ollama_keep_alive_minutes", 10, "Keep the local Ollama model loaded after a reply", validators.Integer(minimum=0, maximum=120)),
             ConfigValue("context_window_override", 4096, "Model context budget", validators.Integer(minimum=2048, maximum=131072)),
             ConfigValue("max_retries", 2, "Retries per model", validators.Integer(minimum=0, maximum=4)),
             ConfigValue("retry_backoff", 1.0, "Retry backoff seconds", _float_validator(0.2, 15.0)),
@@ -78,6 +80,9 @@ class DigitalMeMod(Module):
             ConfigValue("training_turn_gap_seconds", 60, "Owner turn grouping gap", validators.Integer(minimum=5, maximum=600)),
             ConfigValue("recent_messages_limit", 16, "Recent context bubbles", validators.Integer(minimum=6, maximum=100)),
             ConfigValue("rag_result_count", 3, "RAG examples", validators.Integer(minimum=0, maximum=20)),
+            ConfigValue("retrieval_first", True, "Use matching past turns before full AI generation", validators.Boolean()),
+            ConfigValue("retrieval_candidate_limit", 4, "Past reply patterns supplied to fast generation", validators.Integer(minimum=1, maximum=8)),
+            ConfigValue("fast_reply_max_tokens", 80, "Fast reply generation token budget", validators.Integer(minimum=64, maximum=256)),
             ConfigValue("max_message_bubbles", 1, "Maximum reply bubbles", validators.Integer(minimum=1, maximum=12)),
             ConfigValue("max_message_length", 280, "Maximum bubble length", validators.Integer(minimum=64, maximum=4096)),
             ConfigValue("strict_style_mode", True, "Keep replies short and block roleplay actions", validators.Boolean()),
@@ -583,6 +588,8 @@ class DigitalMeMod(Module):
             gap_seconds=float(self.config.get("training_turn_gap_seconds", 60)),
             progress_callback=progress,
         )
+        await progress({"phase": "building_reply_patterns"})
+        await rebuild_reply_patterns(self._database)
         await progress({"phase": "building_personality"})
         await build_personality_profile(self._database, owner_id=self._owner_id)
         await rebuild_relationship_profiles(self._database, owner_id=self._owner_id, progress_callback=progress)

@@ -88,6 +88,19 @@ def tokenize(text: str) -> list[str]:
     return [word.lower() for word in WORD_RE.findall(text) if len(word) > 1]
 
 
+def reply_key(text: str, *, limit: int = 24) -> str:
+    """Stable lexical key for matching a new message to past chat turns."""
+    return " ".join(tokenize(clean_text(text))[:limit])
+
+
+def token_similarity(left: str, right: str) -> float:
+    left_tokens = set(tokenize(left))
+    right_tokens = set(tokenize(right))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
 def estimate_tokens(text: str) -> int:
     """Conservative multilingual estimate when a provider tokenizer is unknown."""
     if not text:

@@ -105,6 +105,42 @@ class PromptBuilder:
             body = self.sanitizer.sanitize(body)
         return [{"role": "system", "content": system}, {"role": "user", "content": body}]
 
+    def build_retrieval_reply(
+        self,
+        *,
+        incoming: list[InboundBubble],
+        recent_messages: list[dict[str, Any]],
+        candidates: list[dict[str, Any]],
+        owner_id: int,
+    ) -> list[dict[str, str]]:
+        """Small prompt for a fresh reply grounded in matching historical turns."""
+        current = [bubble.as_dict() for bubble in incoming]
+        recent = [
+            {
+                "role": "OWNER" if int(item.get("sender_id") or 0) == owner_id else "CONTACT",
+                "text": clean_text(item.get("text"), limit=280),
+            }
+            for item in recent_messages[-6:]
+            if clean_text(item.get("text"))
+        ]
+        examples = [
+            {
+                "incoming": clean_text(item.get("input_text"), limit=240),
+                "past_reply": [clean_text(part, limit=240) for part in item.get("responses", []) if clean_text(part)],
+            }
+            for item in candidates[:4]
+        ]
+        system = (
+            "Write one short Telegram reply in the owner's observed style. Historical replies are style and intent "
+            "signals only: write a fresh response, never copy a past reply verbatim. No roleplay, asterisks, invented "
+            "memories, passwords, secrets, or explanations. Return only JSON: "
+            '{"messages":[{"text":"...","reply_to_message_id":null,"delay_ms":250}],"memory_candidates":[]}.'
+        )
+        body = "Current incoming:\n" + json_dumps(current)
+        body += "\n\nRecent messages:\n" + json_dumps(recent)
+        body += "\n\nSimilar past turns:\n" + json_dumps(examples)
+        return [{"role": "system", "content": system}, {"role": "user", "content": body}]
+
     def _fit_sections(self, sections: list[tuple[str, str, int]], token_budget: int) -> str:
         prepared: list[tuple[str, str]] = []
         for title, content, char_limit in sections:

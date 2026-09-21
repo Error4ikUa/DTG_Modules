@@ -32,26 +32,46 @@ class GenerationEngine:
 
     async def generate(self, item: QueueItem, *, thinking_override: bool | None = None) -> GenerationResult | None:
         current_text = "\n".join(bubble.text for bubble in item.messages)
-        personality = await self.database.get_personality_profile(self.owner_id)
-        relationship = await self.database.get_relationship_profile(item.sender_id)
-        summary = await self.database.get_summary(item.chat_id)
-        memories = await self.database.memory_for_chat(chat_id=item.chat_id, contact_id=item.sender_id, limit=12)
         recent_limit = self._int("recent_messages_limit", 40, 6, 100)
         recent = await self.database.get_recent_messages(item.chat_id, recent_limit)
-        rag_limit = self._int("rag_result_count", 10, 0, 20)
-        examples = await self.rag.search(current_text, chat_id=item.chat_id, contact_id=item.sender_id, limit=rag_limit) if rag_limit else []
-        prompt = self.prompt_builder.build(
-            owner_id=self.owner_id,
-            chat_id=item.chat_id,
-            personality=personality,
-            relationship=relationship,
-            summary=summary,
-            memories=memories,
-            recent_messages=recent,
-            incoming=item.messages,
-            rag_examples=examples,
-        )
-        completion = await self.provider.complete(prompt, thinking_override=thinking_override)
+        candidates = []
+        if bool(self.config_get("retrieval_first", True)):
+            candidates = await self.database.find_reply_candidates(
+                chat_id=item.chat_id,
+                incoming=current_text,
+                limit=self._int("retrieval_candidate_limit", 4, 1, 8),
+            )
+        if candidates:
+            prompt = self.prompt_builder.build_retrieval_reply(
+                incoming=item.messages,
+                recent_messages=recent,
+                candidates=candidates,
+                owner_id=self.owner_id,
+            )
+            completion = await self.provider.complete(
+                prompt,
+                thinking_override=thinking_override,
+                max_tokens_override=self._int("fast_reply_max_tokens", 80, 64, 256),
+            )
+        else:
+            personality = await self.database.get_personality_profile(self.owner_id)
+            relationship = await self.database.get_relationship_profile(item.sender_id)
+            summary = await self.database.get_summary(item.chat_id)
+            memories = await self.database.memory_for_chat(chat_id=item.chat_id, contact_id=item.sender_id, limit=12)
+            rag_limit = self._int("rag_result_count", 10, 0, 20)
+            examples = await self.rag.search(current_text, chat_id=item.chat_id, contact_id=item.sender_id, limit=rag_limit) if rag_limit else []
+            prompt = self.prompt_builder.build(
+                owner_id=self.owner_id,
+                chat_id=item.chat_id,
+                personality=personality,
+                relationship=relationship,
+                summary=summary,
+                memories=memories,
+                recent_messages=recent,
+                incoming=item.messages,
+                rag_examples=examples,
+            )
+            completion = await self.provider.complete(prompt, thinking_override=thinking_override)
         self.last_completion = completion
         reply_ids = {bubble.message_id for bubble in item.messages if bubble.message_id is not None}
         strict_style = bool(self.config_get("strict_style_mode", True))

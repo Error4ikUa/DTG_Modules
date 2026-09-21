@@ -104,7 +104,20 @@ class ProviderRouter:
             total = 60.0
         return aiohttp.ClientTimeout(total=max(5.0, min(300.0, total)))
 
-    async def complete(self, messages: list[dict[str, str]], *, thinking_override: bool | None = None) -> Completion:
+    def _ollama_keep_alive(self) -> str | int:
+        try:
+            minutes = int(self._value("ollama_keep_alive_minutes", 10))
+        except (TypeError, ValueError):
+            minutes = 10
+        return 0 if minutes <= 0 else f"{min(120, minutes)}m"
+
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        thinking_override: bool | None = None,
+        max_tokens_override: int | None = None,
+    ) -> Completion:
         now = time.monotonic()
         if self._cooldown_until > now:
             raise ProviderError("provider_cooldown", retryable=False)
@@ -123,7 +136,12 @@ class ProviderRouter:
         for model in models:
             for attempt in range(retries + 1):
                 try:
-                    result = await self._complete_once(model, messages, thinking_override=thinking_override)
+                    result = await self._complete_once(
+                        model,
+                        messages,
+                        thinking_override=thinking_override,
+                        max_tokens_override=max_tokens_override,
+                    )
                     self._cooldown_until = 0.0
                     self.last_completion = result
                     return result
@@ -140,12 +158,21 @@ class ProviderRouter:
         raise last_error or ProviderError("provider_failed")
 
     async def _complete_once(
-        self, model: str, messages: list[dict[str, str]], *, thinking_override: bool | None = None
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        *,
+        thinking_override: bool | None = None,
+        max_tokens_override: int | None = None,
     ) -> Completion:
         provider = self._provider()
         if provider == "ollama":
-            return await self._ollama_complete(model, messages, thinking_override=thinking_override)
-        return await self._openai_complete(provider, model, messages, thinking_override=thinking_override)
+            return await self._ollama_complete(
+                model, messages, thinking_override=thinking_override, max_tokens_override=max_tokens_override
+            )
+        return await self._openai_complete(
+            provider, model, messages, thinking_override=thinking_override, max_tokens_override=max_tokens_override
+        )
 
     @staticmethod
     def _status_error(status: int) -> ProviderError | None:
@@ -173,7 +200,13 @@ class ProviderRouter:
         return value
 
     async def _openai_complete(
-        self, provider: str, model: str, messages: list[dict[str, str]], *, thinking_override: bool | None = None
+        self,
+        provider: str,
+        model: str,
+        messages: list[dict[str, str]],
+        *,
+        thinking_override: bool | None = None,
+        max_tokens_override: int | None = None,
     ) -> Completion:
         started = time.monotonic()
         base_url = self._base_url(provider)
@@ -187,7 +220,7 @@ class ProviderRouter:
             "messages": messages,
             "temperature": float(self._value("temperature", 0.8)),
             "top_p": float(self._value("top_p", 0.9)),
-            "max_tokens": int(self._value("max_output_tokens", 1000)),
+            "max_tokens": int(max_tokens_override or self._value("max_output_tokens", 1000)),
             "response_format": {"type": "json_object"},
         }
         try:
@@ -249,7 +282,12 @@ class ProviderRouter:
         return supported
 
     async def _ollama_complete(
-        self, model: str, messages: list[dict[str, str]], *, thinking_override: bool | None = None
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        *,
+        thinking_override: bool | None = None,
+        max_tokens_override: int | None = None,
     ) -> Completion:
         started = time.monotonic()
         base_url = self._base_url("ollama")
@@ -262,10 +300,11 @@ class ProviderRouter:
             "messages": messages,
             "stream": True,
             "format": "json",
+            "keep_alive": self._ollama_keep_alive(),
             "options": {
                 "temperature": float(self._value("temperature", 0.8)),
                 "top_p": float(self._value("top_p", 0.9)),
-                "num_predict": int(self._value("max_output_tokens", 1000)),
+                "num_predict": int(max_tokens_override or self._value("max_output_tokens", 1000)),
             },
         }
         if thinking_supported is True:

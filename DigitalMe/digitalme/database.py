@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -9,7 +10,10 @@ from typing import Any
 import aiosqlite
 
 from .memory import ApprovedMemory
-from .utils import json_dumps, json_loads, now_ts
+from .utils import json_dumps, json_loads, now_ts, reply_key, token_similarity
+
+
+SENSITIVE_REPLY_RE = re.compile(r"\b(?:password|passcode|token|api[_ -]?key|secret|session|парол|токен|ключ|сесс)\b", re.IGNORECASE)
 
 
 CORE_SCHEMA = """
@@ -59,6 +63,18 @@ CREATE TABLE IF NOT EXISTS conversation_examples (
 CREATE INDEX IF NOT EXISTS idx_examples_chat_id ON conversation_examples(chat_id);
 CREATE INDEX IF NOT EXISTS idx_examples_contact_id ON conversation_examples(contact_id);
 CREATE INDEX IF NOT EXISTS idx_examples_timestamp ON conversation_examples(timestamp);
+
+CREATE TABLE IF NOT EXISTS reply_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    input_key TEXT NOT NULL,
+    input_text TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    response_text TEXT NOT NULL,
+    timestamp REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reply_patterns_chat_key ON reply_patterns(chat_id, input_key);
+CREATE INDEX IF NOT EXISTS idx_reply_patterns_chat_timestamp ON reply_patterns(chat_id, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS relationship_profiles (
     contact_id INTEGER PRIMARY KEY,
@@ -190,6 +206,15 @@ class DigitalMeDatabase:
             self.fts_enabled = True
         except aiosqlite.OperationalError:
             self.fts_enabled = False
+        try:
+            cursor = await conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reply_pattern_fts'")
+            reply_fts = await cursor.fetchone()
+            await cursor.close()
+            if not reply_fts:
+                await conn.execute("CREATE VIRTUAL TABLE reply_pattern_fts USING fts5(input_text)")
+                await conn.execute("INSERT INTO reply_pattern_fts(rowid, input_text) SELECT id, input_text FROM reply_patterns")
+        except aiosqlite.OperationalError:
+            pass
         await conn.commit()
         self._conn = conn
 
@@ -441,6 +466,98 @@ class DigitalMeDatabase:
     async def count_examples(self) -> int:
         row = await self._fetchone("SELECT COUNT(*) AS count FROM conversation_examples")
         return int(row["count"] if row else 0)
+
+    async def replace_reply_patterns(self, patterns: list[dict[str, Any]]) -> None:
+        """Replace the derived reply index after conversation examples are rebuilt."""
+
+        async def operation() -> None:
+            await self.conn.execute("DELETE FROM reply_patterns")
+            try:
+                await self.conn.execute("DELETE FROM reply_pattern_fts")
+            except aiosqlite.OperationalError:
+                pass
+            if patterns:
+                await self.conn.executemany(
+                    "INSERT INTO reply_patterns(chat_id, input_key, input_text, response_json, response_text, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            int(item["chat_id"]),
+                            str(item["input_key"]),
+                            str(item["input_text"]),
+                            json_dumps(item["responses"]),
+                            str(item["response_text"]),
+                            float(item["timestamp"]),
+                        )
+                        for item in patterns
+                    ],
+                )
+                try:
+                    await self.conn.execute(
+                        "INSERT INTO reply_pattern_fts(rowid, input_text) SELECT id, input_text FROM reply_patterns"
+                    )
+                except aiosqlite.OperationalError:
+                    pass
+
+        await self._write(operation)
+
+    async def find_reply_candidates(self, *, chat_id: int, incoming: str, limit: int = 4) -> list[dict[str, Any]]:
+        """Find same-chat response patterns, preferring exact prior incoming messages."""
+        key = reply_key(incoming)
+        if not key:
+            return []
+        rows = await self._fetchall(
+            "SELECT id, input_key, input_text, response_json, response_text, timestamp FROM reply_patterns "
+            "WHERE chat_id = ? AND input_key = ? ORDER BY timestamp DESC LIMIT ?",
+            (int(chat_id), key, max(1, limit)),
+        )
+        candidates = [candidate for row in rows if (candidate := self._reply_candidate(row, 1.0)) is not None]
+        if len(candidates) >= limit or len(key.split()) < 2:
+            return candidates[:limit]
+
+        terms = [term.replace('"', '') for term in key.split() if len(term) > 1][:12]
+        if not terms:
+            return candidates[:limit]
+        try:
+            fuzzy_rows = await self._fetchall(
+                "SELECT rp.id, rp.input_key, rp.input_text, rp.response_json, rp.response_text, rp.timestamp "
+                "FROM reply_pattern_fts JOIN reply_patterns rp ON rp.id = reply_pattern_fts.rowid "
+                "WHERE reply_pattern_fts MATCH ? AND rp.chat_id = ? LIMIT 32",
+                (" OR ".join(terms), int(chat_id)),
+            )
+        except aiosqlite.OperationalError:
+            fuzzy_rows = await self._fetchall(
+                "SELECT id, input_key, input_text, response_json, response_text, timestamp FROM reply_patterns "
+                "WHERE chat_id = ? AND input_text LIKE ? ORDER BY timestamp DESC LIMIT 32",
+                (int(chat_id), f"%{incoming[:120]}%"),
+            )
+        seen = {int(item["id"]) for item in candidates}
+        for row in fuzzy_rows:
+            score = token_similarity(incoming, str(row["input_text"]))
+            if score < 0.55 or int(row["id"]) in seen:
+                continue
+            candidate = self._reply_candidate(row, score)
+            if candidate is None:
+                continue
+            candidates.append(candidate)
+            seen.add(int(row["id"]))
+            if len(candidates) >= limit:
+                break
+        return candidates[:limit]
+
+    @staticmethod
+    def _reply_candidate(row: sqlite3.Row, score: float) -> dict[str, Any] | None:
+        responses = json_loads(row["response_json"], [])
+        response_text = str(row["response_text"])
+        if not isinstance(responses, list) or SENSITIVE_REPLY_RE.search(response_text):
+            return None
+        return {
+            "id": int(row["id"]),
+            "input_text": str(row["input_text"]),
+            "responses": responses,
+            "response_text": response_text,
+            "score": round(float(score), 3),
+        }
 
     async def iter_examples(self, *, batch_size: int = 500) -> AsyncIterator[dict[str, Any]]:
         last_id = 0

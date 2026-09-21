@@ -12,6 +12,12 @@ REASONING_MARKER_RE = re.compile(
     r"</?think(?:ing)?\b|\b(?:analysis|reasoning(?:_content)?|thinking)\s*[:=]",
     re.IGNORECASE,
 )
+ROLEPLAY_ACTION_PREFIX_RE = re.compile(r"^\s*\*[^*\r\n]{1,500}\*\s*", re.UNICODE)
+
+
+def _clean_generated_text(value: Any, *, limit: int) -> str:
+    """Drop theatrical action prefixes before Telegram receives a model response."""
+    return clean_text(ROLEPLAY_ACTION_PREFIX_RE.sub("", clean_text(value, limit=limit)), limit=limit)
 
 
 @dataclass(slots=True)
@@ -90,7 +96,7 @@ def parse_generation_response(
     """Validate an untrusted LLM result without ever evaluating generated code."""
     parsed = _decode_object(raw)
     if parsed is None:
-        fallback = clean_text(raw, limit=max_message_length)
+        fallback = _clean_generated_text(raw, limit=max_message_length)
         if REASONING_MARKER_RE.search(fallback):
             return None
         return GenerationResult([GeneratedBubble(fallback)]) if fallback else None
@@ -103,7 +109,7 @@ def parse_generation_response(
     for value in source_messages[: max(1, max_bubbles)]:
         if not isinstance(value, dict):
             continue
-        text = clean_text(value.get("text"), limit=max_message_length)
+        text = _clean_generated_text(value.get("text"), limit=max_message_length)
         if not text:
             continue
         raw_delay = value.get("delay_ms", 0)

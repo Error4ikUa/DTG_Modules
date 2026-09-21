@@ -54,10 +54,12 @@ class GenerationEngine:
         completion = await self.provider.complete(prompt, thinking_override=thinking_override)
         self.last_completion = completion
         reply_ids = {bubble.message_id for bubble in item.messages if bubble.message_id is not None}
+        strict_style = bool(self.config_get("strict_style_mode", True))
+        configured_length = self._int("max_message_length", 280, 64, 4096)
         result = parse_generation_response(
             completion.content,
-            max_bubbles=self._int("max_message_bubbles", 5, 1, 12),
-            max_message_length=self._int("max_message_length", 1200, 64, 4096),
+            max_bubbles=1 if strict_style else self._int("max_message_bubbles", 1, 1, 12),
+            max_message_length=min(configured_length, 280) if strict_style else configured_length,
             min_delay_ms=self._int("min_delay_ms", 250, 0, 60000),
             max_delay_ms=self._int("max_delay_ms", 5000, 0, 60000),
             allowed_reply_ids={int(item) for item in reply_ids},

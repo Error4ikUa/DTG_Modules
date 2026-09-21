@@ -382,6 +382,10 @@ class DigitalMeDatabase:
         rows = await self._fetchall("SELECT chat_id FROM dialogs ORDER BY chat_id")
         return [int(row["chat_id"]) for row in rows]
 
+    async def dialog_display_names(self) -> list[str]:
+        rows = await self._fetchall("SELECT display_name FROM dialogs WHERE display_name != ''")
+        return [str(row["display_name"]) for row in rows if str(row["display_name"]).strip()]
+
     async def iter_messages(
         self,
         *,
@@ -463,8 +467,11 @@ class DigitalMeDatabase:
 
         await self._write(operation)
 
-    async def count_examples(self) -> int:
-        row = await self._fetchone("SELECT COUNT(*) AS count FROM conversation_examples")
+    async def count_examples(self, *, chat_id: int | None = None) -> int:
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS count FROM conversation_examples" + (" WHERE chat_id = ?" if chat_id is not None else ""),
+            (int(chat_id),) if chat_id is not None else (),
+        )
         return int(row["count"] if row else 0)
 
     async def replace_reply_patterns(self, patterns: list[dict[str, Any]]) -> None:
@@ -693,8 +700,11 @@ class DigitalMeDatabase:
 
         await self._write(operation)
 
-    async def count_rag_documents(self) -> int:
-        row = await self._fetchone("SELECT COUNT(*) AS count FROM rag_documents")
+    async def count_rag_documents(self, *, chat_id: int | None = None) -> int:
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS count FROM rag_documents" + (" WHERE chat_id = ?" if chat_id is not None else ""),
+            (int(chat_id),) if chat_id is not None else (),
+        )
         return int(row["count"] if row else 0)
 
     async def count_embeddings(self) -> int:

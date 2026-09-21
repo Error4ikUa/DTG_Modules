@@ -65,7 +65,7 @@ class DigitalMeMod(Module):
             ConfigValue("base_url", "http://127.0.0.1:11434", "Provider base URL", validators.String(max_len=500)),
             ConfigValue("enable_thinking", False, "Use a provider-native thinking mode when it is supported", validators.Boolean()),
             ConfigValue("api_key", "", "Remote provider API key", validators.String(max_len=1000), secret=True),
-            ConfigValue("model", "qwen3:8b", "Primary model", validators.String(min_len=1, max_len=200)),
+            ConfigValue("model", "runeweaver", "Primary model", validators.String(min_len=1, max_len=200)),
             ConfigValue("fallback_models", "", "Comma-separated fallback model IDs", validators.String(max_len=1000)),
             ConfigValue("temperature", 0.8, "Sampling temperature", _float_validator(0.0, 2.0)),
             ConfigValue("top_p", 0.9, "Top-p sampling", _float_validator(0.0, 1.0)),
@@ -84,13 +84,15 @@ class DigitalMeMod(Module):
             ConfigValue("retrieval_candidate_limit", 4, "Past reply patterns supplied to fast generation", validators.Integer(minimum=1, maximum=8)),
             ConfigValue("fast_reply_max_tokens", 80, "Fast reply generation token budget", validators.Integer(minimum=64, maximum=256)),
             ConfigValue("max_message_bubbles", 1, "Maximum reply bubbles", validators.Integer(minimum=1, maximum=12)),
-            ConfigValue("max_message_length", 280, "Maximum bubble length", validators.Integer(minimum=64, maximum=4096)),
+            ConfigValue("max_message_length", 280, "Maximum bubble length", validators.Integer(minimum=32, maximum=4096)),
+            ConfigValue("max_style_length_multiplier", 3.0, "Maximum length relative to observed owner style", _float_validator(1.0, 8.0)),
             ConfigValue("strict_style_mode", True, "Keep replies short and block roleplay actions", validators.Boolean()),
             ConfigValue("min_delay_ms", 250, "Minimum natural delay", validators.Integer(minimum=0, maximum=60000)),
             ConfigValue("max_delay_ms", 5000, "Maximum natural delay", validators.Integer(minimum=0, maximum=60000)),
             ConfigValue("max_parallel_generations", 1, "Fixed global generation parallelism", validators.Integer(minimum=1, maximum=1)),
             ConfigValue("sanitize_cloud_prompts", True, "Mask common secrets before cloud requests", validators.Boolean()),
             ConfigValue("debug_log_prompts", False, "Never log prompt contents by default", validators.Boolean()),
+            ConfigValue("debug_mode", False, "Show owner-only generation diagnostics", validators.Boolean()),
             ConfigValue("cancel_stale_tasks", True, "Cancel pending 'never mind' tasks", validators.Boolean()),
             ConfigValue("cross_contact_style_examples", False, "Use anonymized examples from other chats", validators.Boolean()),
             ConfigValue("embedding_mode", "off", "off, local, remote", validators.Choice(("off", "local", "remote"))),
@@ -211,10 +213,10 @@ class DigitalMeMod(Module):
     @command("aitoken", description="Save remote provider key or select local Ollama", usage=".aitoken <key> | .aitoken local [model]", security="owner")
     async def aitoken_cmd(self, event, args) -> None:
         if not args:
-            await self._edit(event, "<b>Usage:</b> <code>.aitoken &lt;key&gt;</code> or <code>.aitoken local qwen3:8b</code>")
+            await self._edit(event, "<b>Usage:</b> <code>.aitoken &lt;key&gt;</code> or <code>.aitoken local runeweaver</code>")
             return
         if str(args[0]).lower() in {"local", "ollama"}:
-            model = " ".join(args[1:]).strip() or "qwen3:8b"
+            model = " ".join(args[1:]).strip() or "runeweaver"
             self._set_config("provider", "ollama")
             self._set_config("base_url", "http://127.0.0.1:11434")
             self._set_config("model", model)
@@ -292,9 +294,16 @@ class DigitalMeMod(Module):
 
     @command("aitest", description="Test the configured AI provider without messaging anyone", usage=".aitest", security="owner")
     async def aitest_cmd(self, event, args) -> None:
-        if not self._provider:
+        if not self._provider or not self._database or not self._queue:
             await self._edit(event, "<b>DigitalMe is still starting.</b>")
             return
+        stats = await self._database.statistics(self._owner_id)
+        running, waiting = await self._queue.snapshot()
+        data_state = (
+            f"Database: <code>{stats['messages']} messages / {stats['examples']} examples</code>\n"
+            f"RAG: <code>{stats['rag_documents']} docs</code> | Relationships: <code>{stats['relationships']}</code>\n"
+            f"Queue: <code>{len(waiting)} waiting{' + running' if running else ''}</code>\n"
+        )
         try:
             completion = await self._provider.complete(
                 [
@@ -313,7 +322,8 @@ class DigitalMeMod(Module):
                 f"Model: <code>{html.escape(completion.model)}</code>\n"
                 f"Thinking: <code>{'ON' if completion.thinking_requested else 'OFF'}</code>\n"
                 f"Latency: <code>{completion.latency_ms / 1000:.2f} sec</code>{ttft}\n"
-                f"Status: <code>OK</code>{warning}",
+                + data_state
+                + f"Status: <code>OK</code>{warning}",
             )
         except ProviderError as exc:
             await self._edit(
@@ -322,7 +332,8 @@ class DigitalMeMod(Module):
                 f"Provider: <code>{html.escape(str(self.config.get('provider')))}</code>\n"
                 f"Model: <code>{html.escape(str(self.config.get('model')))}</code>\n"
                 "Thinking: <code>OFF</code>\n"
-                f"Status: <code>{html.escape(exc.kind)}</code>",
+                + data_state
+                + f"Status: <code>{html.escape(exc.kind)}</code>",
             )
 
     @command("clone", description="Preview a DigitalMe reply without sending it", usage=".clone [--chat id] text", security="owner")
@@ -343,6 +354,28 @@ class DigitalMeMod(Module):
         if not text:
             await self._edit(event, "<b>Usage:</b> <code>.clone [--chat id] text</code>")
             return
+        await self._preview_reply(event, chat_id, text)
+
+    @command("clonechat", description="Preview a reply with another chat's style", usage=".clonechat <chat_id> text", security="owner")
+    async def clonechat_cmd(self, event, args) -> None:
+        if len(args) < 2:
+            await self._edit(event, "<b>Usage:</b> <code>.clonechat &lt;chat_id&gt; text</code>")
+            return
+        try:
+            chat_id = int(args[0])
+        except (TypeError, ValueError):
+            await self._edit(event, "<b>Chat ID must be numeric.</b>")
+            return
+        text = clean_text(" ".join(args[1:]), limit=4000)
+        if not text:
+            await self._edit(event, "<b>Usage:</b> <code>.clonechat &lt;chat_id&gt; text</code>")
+            return
+        await self._preview_reply(event, chat_id, text)
+
+    async def _preview_reply(self, event, chat_id: int, text: str) -> None:
+        if not self._ready() or not self._engine:
+            await self._edit(event, "<b>DigitalMe is still starting.</b>")
+            return
         item = QueueItem(
             chat_id=chat_id,
             sender_id=chat_id,
@@ -360,6 +393,53 @@ class DigitalMeMod(Module):
         self._last_completion = self._engine.last_completion
         bubbles = "\n".join(html.escape(bubble.text) for bubble in result.messages)
         await self._edit(event, f"<b>DigitalMe preview</b>\n<blockquote>{bubbles}</blockquote>")
+
+    @command("aistyle", description="Show the imported style profile for a chat", usage=".aistyle [chat_id]", security="owner")
+    async def aistyle_cmd(self, event, args) -> None:
+        if not self._database:
+            await self._edit(event, "<b>DigitalMe is still starting.</b>")
+            return
+        chat_id = self._target_chat_id(event, args)
+        if chat_id is None:
+            await self._edit(event, "<b>Use this in a private chat or pass its numeric chat ID.</b>")
+            return
+        dialog = await self._database.get_dialog(chat_id)
+        relationship = await self._database.get_relationship_profile(chat_id)
+        examples = await self._database.count_examples(chat_id=chat_id)
+        documents = await self._database.count_rag_documents(chat_id=chat_id)
+        average = relationship.get("typical_message_length", {}).get("average", 0)
+        await self._edit(
+            event,
+            "<b>DigitalMe style profile</b>\n"
+            f"Chat: <code>{chat_id}</code> {html.escape(str(dialog.get('display_name') or ''))}\n"
+            f"Examples: <code>{examples}</code> | RAG: <code>{documents}</code>\n"
+            f"Tone: <code>{html.escape(str(relationship.get('relationship_type') or 'unknown'))}</code>\n"
+            f"Average owner message: <code>{average}</code> chars\n"
+            f"Terms: <code>{html.escape(', '.join(relationship.get('common_terms', [])[:12]) or 'none')}</code>",
+        )
+
+    @command("aidebug", description="Show or toggle owner-only diagnostics", usage=".aidebug [on|off]", security="owner")
+    async def aidebug_cmd(self, event, args) -> None:
+        if args:
+            value = str(args[0]).lower()
+            if value not in {"on", "off"}:
+                await self._edit(event, "<b>Usage:</b> <code>.aidebug [on|off]</code>")
+                return
+            self._set_config("debug_mode", value == "on")
+        completion = self._last_completion
+        details = "No generation has completed since this module started."
+        if completion:
+            ttft = f", TTFT {completion.ttft_ms / 1000:.2f}s" if completion.ttft_ms is not None else ""
+            details = f"{html.escape(completion.provider)} / {html.escape(completion.model)}: {completion.latency_ms / 1000:.2f}s{ttft}"
+            if completion.warning:
+                details += "; thinking fallback used"
+        await self._edit(
+            event,
+            "<b>DigitalMe diagnostics</b>\n"
+            f"Mode: <code>{'ON' if self.config.get('debug_mode') else 'OFF'}</code>\n"
+            f"Last completion: <code>{details}</code>\n"
+            "Prompt and message contents are never shown here.",
+        )
 
     @command("aiallow", description="Allow only this private chat when an allowlist is used", usage=".aiallow [chat_id]", security="owner")
     async def aiallow_cmd(self, event, args) -> None:

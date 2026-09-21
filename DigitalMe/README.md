@@ -8,7 +8,7 @@ The module starts with these values:
 
 ```text
 provider = "ollama"
-model = "qwen3:8b"
+model = "runeweaver"
 base_url = "http://127.0.0.1:11434"
 enable_thinking = False
 ```
@@ -16,7 +16,7 @@ enable_thinking = False
 No API key is needed for Ollama. Install and start Ollama, then download the model once:
 
 ```powershell
-ollama pull qwen3:8b
+ollama create runeweaver -f .\Modelfile
 ollama serve
 ```
 
@@ -31,7 +31,7 @@ After DTG starts and you log in, run `.aitest` in Saved Messages. A healthy resu
 | `.aitakeinfo` | Reply to Telegram Desktop's `result.json` document, then run this command to download, import, and analyze it. |
 | `.aitoken <token>` | Stores an API key for a remote OpenAI-compatible or OpenRouter provider. The value is never echoed back. |
 
-`.aitoken local qwen3:8b` is a convenience command for returning to the default local Ollama configuration. It does not need a key.
+`.aitoken local runeweaver` is a convenience command for returning to the default local Ollama configuration. It does not need a key.
 
 Useful owner-only diagnostics and controls:
 
@@ -43,6 +43,9 @@ Useful owner-only diagnostics and controls:
 | `.aiallow` | In a direct chat, limits future automatic replies to that chat once an allowlist exists. |
 | `.aideny` | Disables automatic replies for a direct chat. |
 | `.clone [--chat <id>] <text>` | Previews a generated reply without sending it. |
+| `.clonechat <chat_id> <text>` | Previews a reply using a specific chat's imported style. |
+| `.aistyle [chat_id]` | Shows the stored relationship/style profile and local RAG coverage. |
+| `.aidebug [on\|off]` | Shows owner-only provider timing diagnostics without prompt or message contents. |
 | `.aitakeinfo status` | Shows import progress. |
 | `.aitakeinfo cancel` | Requests cancellation of an active import. |
 
@@ -52,13 +55,13 @@ All module commands are owner-only.
 
 In Telegram Desktop, export data as JSON and include personal chats. Send the resulting `result.json` to Saved Messages (or any chat where you can reply as owner), reply to the document with `.aitakeinfo`, and wait for the completion message.
 
-The importer reads the export incrementally rather than loading it all into memory. It accepts only personal/private chats and normal text messages. The owner is identified from numeric Telegram IDs, never display names. After import DigitalMe builds dialogue turns, a personality profile, relationship profiles, rolling chat summaries, and SQLite FTS/RAG documents.
+The importer reads the export incrementally rather than loading it all into memory. It accepts only personal/private chats and normal text messages. The owner is identified from numeric Telegram IDs, never display names. After import DigitalMe builds dialogue turns, a personality profile, relationship profiles, rolling chat summaries, and SQLite FTS/RAG documents. Re-importing the same file is safe: message IDs are deduplicated. RAG excludes likely secrets and anonymizes contact names; a chat uses its own examples first, then only anonymized global style examples when it has none.
 
 The raw downloaded export and database remain local under `modules/DigitalMe/data/` and are ignored by Git. Do not share this directory or back it up to an untrusted location.
 
 ## Automatic reply behavior
 
-DigitalMe only considers direct private chats with normal users. It ignores groups, channels, bots, service messages, Saved Messages, outgoing messages, and empty/media-only input.
+DigitalMe only considers direct private chats with normal users. It ignores groups, channels, bots, service messages, Saved Messages, outgoing messages, and empty/media-only input. Replies default to one short bubble; the model is told to follow observed owner examples and cannot send reasoning, stage directions, or plaintext tool output.
 
 There is exactly one generation worker. Short bursts from one person are buffered for `debounce_seconds` (default 2.5 seconds) while preserving separate bubbles. Tasks then run in global FIFO order. A later message from a chat already being generated becomes a new task at the end of the queue.
 

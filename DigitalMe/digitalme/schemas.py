@@ -13,11 +13,24 @@ REASONING_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 ROLEPLAY_ACTION_PREFIX_RE = re.compile(r"^\s*\*[^*\r\n]{1,500}\*\s*", re.UNICODE)
+ROLEPLAY_ACTION_RE = re.compile(r"\*[^*\r\n]{1,500}\*", re.UNICODE)
+GENERIC_ASSISTANT_RE = re.compile(
+    r"\b(?:конечно|я понимаю|я могу помочь|если хочешь|если хотите|расскаж(?:и|ите) подробнее|"
+    r"чем могу помочь|давайте разбер[её]мся|могу предложить|я постараюсь|мне очень жаль|как делишки)\b",
+    re.IGNORECASE,
+)
 
 
 def _clean_generated_text(value: Any, *, limit: int) -> str:
     """Drop theatrical action prefixes before Telegram receives a model response."""
     return clean_text(ROLEPLAY_ACTION_PREFIX_RE.sub("", clean_text(value, limit=limit)), limit=limit)
+
+
+def needs_style_retry(result: GenerationResult | None) -> bool:
+    if not result:
+        return False
+    text = "\n".join(message.text for message in result.messages)
+    return bool(ROLEPLAY_ACTION_RE.search(text) or GENERIC_ASSISTANT_RE.search(text))
 
 
 @dataclass(slots=True)

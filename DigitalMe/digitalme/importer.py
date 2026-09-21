@@ -22,6 +22,10 @@ class ImportCancelled(RuntimeError):
     pass
 
 
+class ImportFormatError(RuntimeError):
+    """The Telegram export is syntactically incomplete or otherwise malformed."""
+
+
 @dataclass(slots=True)
 class ImportStats:
     phase: str = "idle"
@@ -134,6 +138,7 @@ class TelegramExportImporter:
             raise ValueError("Expected a local Telegram result.json export")
         self._cancel_event.clear()
         stats = ImportStats(phase="parsing", file_size=path.stat().st_size)
+        import_run_id = time.time()
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=6)
         loop = asyncio.get_running_loop()
         producer = asyncio.create_task(asyncio.to_thread(self._produce, path, owner_id, loop, queue, stats))
@@ -144,7 +149,7 @@ class TelegramExportImporter:
                 kind, value = await queue.get()
                 if kind == "batch":
                     batch = value
-                    inserted = await self.database.insert_import_batch(batch)
+                    inserted = await self.database.insert_import_batch(batch, import_run_id=import_run_id)
                     stats.imported_messages += inserted
                     seen_chats.update(int(record["chat_id"]) for record in batch)
                     stats.dialogs = len(seen_chats)
@@ -156,7 +161,9 @@ class TelegramExportImporter:
                 elif kind == "cancelled":
                     raise ImportCancelled("Import cancelled by owner")
                 elif kind == "error":
-                    raise RuntimeError(str(value))
+                    if value == "incomplete_json":
+                        raise ImportFormatError("Telegram result.json ended before the JSON document was complete")
+                    raise RuntimeError("Telegram export parser failed")
                 if progress_callback and time.monotonic() - last_progress > 1.0:
                     last_progress = time.monotonic()
                     await progress_callback(stats.payload())
@@ -166,10 +173,12 @@ class TelegramExportImporter:
                 await progress_callback(stats.payload())
             return stats
         except ImportCancelled:
+            await self.database.rollback_import_run(import_run_id)
             stats.phase = "cancelled"
             await self.database.set_import_status(stats.payload())
             raise
         except Exception:
+            await self.database.rollback_import_run(import_run_id)
             stats.phase = "failed"
             await self.database.set_import_status(stats.payload())
             raise
@@ -228,7 +237,8 @@ class TelegramExportImporter:
         except ImportCancelled:
             put("cancelled", None)
         except Exception as exc:
-            put("error", f"Telegram export parser failed: {type(exc).__name__}")
+            incomplete = ijson is not None and isinstance(exc, ijson.common.IncompleteJSONError)
+            put("error", "incomplete_json" if incomplete else "parser_error")
 
     def _stream_records(self, path: Path, owner_id: int):
         if ijson is None:

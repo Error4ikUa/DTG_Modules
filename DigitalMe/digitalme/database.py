@@ -263,14 +263,14 @@ class DigitalMeDatabase:
         except (TypeError, ValueError):
             return None
 
-    async def insert_import_batch(self, records: list[dict[str, Any]]) -> int:
+    async def insert_import_batch(self, records: list[dict[str, Any]], *, import_run_id: float | None = None) -> int:
         if not records:
             return 0
 
         async def operation() -> int:
             dialogs: dict[int, tuple[Any, ...]] = {}
             payload: list[tuple[Any, ...]] = []
-            current = now_ts()
+            current = float(import_run_id) if import_run_id is not None else now_ts()
             for record in records:
                 chat_id = int(record["chat_id"])
                 timestamp = float(record.get("timestamp") or 0.0)
@@ -317,6 +317,17 @@ class DigitalMeDatabase:
             return max(0, self.conn.total_changes - before)
 
         return int(await self._write(operation) or 0)
+
+    async def rollback_import_run(self, import_run_id: float) -> None:
+        """Remove only rows written by an import that did not complete."""
+
+        async def operation() -> None:
+            await self.conn.execute("DELETE FROM messages WHERE imported_at = ?", (float(import_run_id),))
+            await self.conn.execute(
+                "DELETE FROM dialogs WHERE chat_id NOT IN (SELECT DISTINCT chat_id FROM messages)"
+            )
+
+        await self._write(operation)
 
     async def insert_live_message(
         self,

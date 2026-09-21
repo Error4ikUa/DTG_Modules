@@ -18,7 +18,7 @@ from deathtg.loader import ConfigValue, Module, ModuleConfig, validators, watche
 from .digitalme.database import DigitalMeDatabase
 from .digitalme.debounce import PerChatDebounce
 from .digitalme.embeddings import EmbeddingService
-from .digitalme.importer import ImportCancelled, TelegramExportImporter
+from .digitalme.importer import ImportCancelled, ImportFormatError, TelegramExportImporter
 from .digitalme.llm import GenerationEngine
 from .digitalme.memory import MemoryEvaluator
 from .digitalme.personality import (
@@ -551,6 +551,14 @@ class DigitalMeMod(Module):
             await self._edit(event, "<b>DigitalMe import complete.</b>\nUse <code>.aistart</code> when you are ready.")
         except ImportCancelled:
             await self._edit(event, "<b>DigitalMe import cancelled.</b>")
+        except ImportFormatError:
+            await self._database.set_import_status({"phase": "failed", "error": "incomplete_export"})
+            await self._edit(
+                event,
+                "<b>DigitalMe import stopped.</b>\n"
+                "<code>result.json</code> is incomplete. Create a new Telegram Desktop export, wait for it to finish, "
+                "then reply to the new file with <code>.aitakeinfo</code>.",
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

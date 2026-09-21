@@ -58,6 +58,10 @@ def parse_timestamp(value: Any) -> float:
     if not raw:
         return 0.0
     try:
+        return float(raw)
+    except ValueError:
+        pass
+    try:
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0

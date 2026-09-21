@@ -11,7 +11,10 @@ GREETING_RE = re.compile(r"^(?:прив+е*т|даров+а*|хай|ку|здо�
 NAME_RE = re.compile(r"\b(?:как\s+(?:тебя\s+)?зовут|ты\s+(?:же\s+)?(?:вова|володя))\b", re.IGNORECASE)
 WHAT_DOING_RE = re.compile(r"\b(?:что|ч[её])\s+(?:ты\s+)?дела(?:ешь|ете)\b", re.IGNORECASE)
 HOW_ARE_RE = re.compile(r"\b(?:как\s+ты|как\s+дела|ч[её]\s+как)\b", re.IGNORECASE)
+INTEREST_RE = re.compile(r"\b(?:чем\s+(?:ты\s+)?увлекаешься|какие\s+интересы|чем\s+занимаешься)\b", re.IGNORECASE)
 WHY_RUDE_RE = re.compile(r"\b(?:почему\s+(?:ты\s+)?груб|за\s+что|ч[её]\s+ты\s+нес[её]шь)\b", re.IGNORECASE)
+REPEAT_RE = re.compile(r"\b(?:повторяешь|сообщения\s+повторяются)\b", re.IGNORECASE)
+CHANGE_RE = re.compile(r"\b(?:изменился|что\s+случилось|что\s+не\s+скажу)\b", re.IGNORECASE)
 GAME_RE = re.compile(r"\b(?:(?:го|пойд[её]м|зайд[её]м).{0,24}(?:дот[ауе]|фортнайт|кс(?:2)?|майн(?:крафт)?)|(?:дот[ауе]|фортнайт|кс(?:2)?|майн(?:крафт)?).{0,24}(?:го|пойд[её]м|зайд[её]м))\b", re.IGNORECASE)
 AUTOMATION_RE = re.compile(r"\b(?:ты\s+(?:ии|ai|бот|нейросеть|модель)|это\s+ии)\b", re.IGNORECASE)
 HOSTAGE_RE = re.compile(r"\b(?:заложник\w*|тебе\s+плохо)\b", re.IGNORECASE)
@@ -42,12 +45,18 @@ def quick_reply(text: str, *, owner_name: str = "Вова") -> str | None:
         return "та ниче, ты шо"
     if HOW_ARE_RE.search(lowered):
         return "нормально вроде"
+    if INTEREST_RE.search(lowered):
+        return "да всем понемногу, в игры играю"
     if GAME_RE.search(lowered):
         return "го"
     if HOSTAGE_RE.search(lowered):
         return "та нет"
     if WHY_RUDE_RE.search(lowered):
         return "та ни за что"
+    if REPEAT_RE.search(lowered):
+        return "та не"
+    if CHANGE_RE.search(lowered):
+        return "да ниче"
     if INSULT_RE.search(lowered):
         return "та ладно тебе"
     return None

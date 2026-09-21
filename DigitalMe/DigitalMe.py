@@ -67,7 +67,7 @@ class DigitalMeMod(Module):
             ConfigValue("api_key", "", "Remote provider API key", validators.String(max_len=1000), secret=True),
             ConfigValue("model", "runeweaver", "Primary model", validators.String(min_len=1, max_len=200)),
             ConfigValue("fallback_models", "", "Comma-separated fallback model IDs", validators.String(max_len=1000)),
-            ConfigValue("temperature", 0.8, "Sampling temperature", _float_validator(0.0, 2.0)),
+            ConfigValue("temperature", 0.55, "Sampling temperature", _float_validator(0.0, 2.0)),
             ConfigValue("top_p", 0.9, "Top-p sampling", _float_validator(0.0, 1.0)),
             ConfigValue("max_output_tokens", 160, "Maximum completion tokens", validators.Integer(minimum=64, maximum=8192)),
             ConfigValue("timeout_seconds", 60, "Provider timeout", validators.Integer(minimum=5, maximum=300)),
@@ -94,7 +94,9 @@ class DigitalMeMod(Module):
             ConfigValue("debug_log_prompts", False, "Never log prompt contents by default", validators.Boolean()),
             ConfigValue("debug_mode", False, "Show owner-only generation diagnostics", validators.Boolean()),
             ConfigValue("cancel_stale_tasks", True, "Cancel pending 'never mind' tasks", validators.Boolean()),
-            ConfigValue("cross_contact_style_examples", False, "Use anonymized examples from other chats", validators.Boolean()),
+            ConfigValue("cross_contact_style_examples", True, "Use anonymized examples from other chats", validators.Boolean()),
+            ConfigValue("observe_manual_messages", True, "Learn from new manual owner messages locally", validators.Boolean()),
+            ConfigValue("observation_rebuild_seconds", 300, "Delay before rebuilding local training data", validators.Integer(minimum=30, maximum=3600)),
             ConfigValue("embedding_mode", "off", "off, local, remote", validators.Choice(("off", "local", "remote"))),
             ConfigValue("embedding_model", "", "Optional embedding model", validators.String(max_len=300)),
             ConfigValue("import_max_mb", 2048, "Largest accepted Telegram export", validators.Integer(minimum=10, maximum=16384)),
@@ -113,6 +115,8 @@ class DigitalMeMod(Module):
         self._shutting_down = False
         self._last_owner_notice = 0.0
         self._last_completion = None
+        self._generated_signatures: dict[tuple[int, str], float] = {}
+        self._observation_task: asyncio.Task | None = None
 
     async def client_ready(self, client, db=None) -> None:
         if self._started:
@@ -156,6 +160,10 @@ class DigitalMeMod(Module):
                 self._import_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._import_task
+        if self._observation_task and not self._observation_task.done():
+            self._observation_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._observation_task
         if self._debounce:
             await self._debounce.close()
         if self._queue:
@@ -519,6 +527,39 @@ class DigitalMeMod(Module):
             # Watchers must never surface an exception to a private correspondent.
             return
 
+    @watcher("out", no_commands=True)
+    async def outgoing_observer(self, event) -> None:
+        """Persist only manual owner messages; generated replies must never train the persona."""
+        try:
+            if not self._ready() or self._shutting_down or not self._database:
+                return
+            if not bool(self.config.get("observe_manual_messages", True)):
+                return
+            if not getattr(event, "is_private", False) or getattr(event, "is_group", False) or getattr(event, "is_channel", False):
+                return
+            chat_id = int(getattr(event, "chat_id", 0) or 0)
+            if not chat_id or chat_id == self._owner_id:
+                return
+            text = clean_text(getattr(event, "raw_text", ""))
+            if not text or self._is_recent_generated(chat_id, text):
+                return
+            message_id = int(getattr(event, "id", 0) or 0) or None
+            reply_to = getattr(getattr(event, "message", None), "reply_to_msg_id", None)
+            dialog = await self._database.get_dialog(chat_id)
+            await self._database.insert_live_message(
+                chat_id=chat_id,
+                sender_id=self._owner_id,
+                message_id=message_id,
+                timestamp=now_ts(),
+                text=text,
+                reply_to_message_id=int(reply_to) if reply_to else None,
+                display_name=str(dialog.get("display_name") or ""),
+                message_type="manual_owner",
+            )
+            self._schedule_observation_rebuild()
+        except Exception:
+            return
+
     async def _enqueue_debounced(self, chat_id: int, sender_id: int, bubbles: list[InboundBubble]) -> None:
         if not self._queue or not self._database or not bool(self.config.get("enabled", False)):
             return
@@ -581,6 +622,7 @@ class DigitalMeMod(Module):
             if reply_to is None and index == 0 and item.messages:
                 reply_to = item.messages[-1].message_id
             try:
+                self._remember_generated(item.chat_id, bubble.text)
                 sent = await self.client.send_message(item.chat_id, bubble.text, reply_to=reply_to)
             except Exception as exc:
                 await self._database.queue_status(item.generation_id, "failed", error_kind=type(exc).__name__)
@@ -603,6 +645,34 @@ class DigitalMeMod(Module):
             recent_limit=int(self.config.get("recent_messages_limit", 40)) * 4,
         )
         await self._database.queue_status(item.generation_id, "done")
+
+    def _remember_generated(self, chat_id: int, text: str) -> None:
+        now = time.monotonic()
+        self._generated_signatures = {
+            key: timestamp for key, timestamp in self._generated_signatures.items() if now - timestamp < 90
+        }
+        self._generated_signatures[(chat_id, text)] = now
+
+    def _is_recent_generated(self, chat_id: int, text: str) -> bool:
+        timestamp = self._generated_signatures.get((chat_id, text))
+        return timestamp is not None and time.monotonic() - timestamp < 90
+
+    def _schedule_observation_rebuild(self) -> None:
+        if self._observation_task and not self._observation_task.done():
+            return
+        self._observation_task = asyncio.create_task(self._rebuild_observed_style())
+
+    async def _rebuild_observed_style(self) -> None:
+        try:
+            await asyncio.sleep(int(self.config.get("observation_rebuild_seconds", 300)))
+            if not self._shutting_down and self._database and self._engine:
+                await self._rebuild_analysis()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._notify_owner("local style observer could not rebuild training data")
+        finally:
+            self._observation_task = None
 
     async def _generate_with_typing(self, item: QueueItem):
         action = getattr(self.client, "action", None)

@@ -16,6 +16,12 @@ LATIN_RE = re.compile("[A-Za-z]")
 PROFANITY_STEMS = ("бля", "бл", "сука", "хуй", "пизд", "еб", "fuck", "shit")
 AFFECTION_TERMS = ("люб", "зай", "кот", "сонц", "мила", "серд")
 TEASING_TERMS = ("лол", "кек", "слаб", "дур", "клоун", "рофл")
+INTEREST_TERMS = {
+    "games": ("дота", "фортнайт", "майн", "кс ", "cs2"),
+    "coding": ("пайтон", "python", "код", "софт"),
+    "series": ("сериал", "рик и морти", "аниме", "фильм"),
+    "sport": ("трениров", "спортзал", "зал"),
+}
 
 
 @dataclass(slots=True)
@@ -178,6 +184,7 @@ async def build_personality_profile(database: DigitalMeDatabase, *, owner_id: in
     punctuation: Counter[str] = Counter()
     lengths: list[int] = []
     profane: Counter[str] = Counter()
+    interests: Counter[str] = Counter()
     uppercase_messages = 0
     total_messages = 0
 
@@ -195,6 +202,9 @@ async def build_personality_profile(database: DigitalMeDatabase, *, owner_id: in
         if text.isupper() and len(text) > 3:
             uppercase_messages += 1
         lowered = text.lower()
+        for label, markers in INTEREST_TERMS.items():
+            if any(marker in lowered for marker in markers):
+                interests[label] += 1
         for stem in PROFANITY_STEMS:
             if stem in lowered:
                 profane[stem] += 1
@@ -224,6 +234,7 @@ async def build_personality_profile(database: DigitalMeDatabase, *, owner_id: in
             "preferred_length": "short" if average_length <= 50 else "medium" if average_length <= 180 else "long",
             "sample_size": total_messages,
         },
+        "interest_hints": [label for label, count in interests.most_common() if count >= 3],
     }
     await database.set_personality_profile(owner_id, profile)
     return profile

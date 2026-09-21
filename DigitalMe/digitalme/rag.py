@@ -9,6 +9,15 @@ from .sanitizer import PromptSanitizer
 from .utils import clean_text, json_loads
 
 
+TOPIC_EXPANSIONS = {
+    "увлека": "хобби интересы люблю играю смотрю занимаюсь дота фортнайт код",
+    "хобби": "увлекаюсь интересы люблю играю смотрю занимаюсь дота фортнайт код",
+    "занимаешь": "увлекаюсь интересы люблю играю смотрю занимаюсь дота фортнайт код",
+    "игра": "дота кс фортнайт майнкрафт",
+    "смотришь": "фильм сериал аниме рик морти",
+}
+
+
 class RAGService:
     def __init__(
         self,
@@ -86,14 +95,50 @@ class RAGService:
         contact_id: int,
         limit: int,
     ) -> list[dict[str, Any]]:
-        same_chat_only = not bool(self.config_get("cross_contact_style_examples", False))
-        return await self._search_scope(
-            query,
+        expanded_query = self._expand_query(query)
+        local = await self._search_scope(
+            expanded_query,
             chat_id=chat_id,
             contact_id=contact_id,
-            same_chat_only=same_chat_only,
+            same_chat_only=True,
             limit=limit,
         )
+        if len(local) >= max(1, limit) or not bool(self.config_get("cross_contact_style_examples", True)):
+            return local
+        names = await self.database.dialog_display_names()
+        global_results = await self._search_scope(
+            expanded_query,
+            chat_id=chat_id,
+            contact_id=contact_id,
+            same_chat_only=False,
+            limit=limit,
+        )
+        seen = {int(item["id"]) for item in local}
+        for document in global_results:
+            if int(document["id"]) in seen:
+                continue
+            item = dict(document)
+            item["scope"] = "global_style"
+            item["content"] = self._global_style_view(str(item.get("content") or ""), names)
+            local.append(item)
+            seen.add(int(item["id"]))
+            if len(local) >= max(1, limit):
+                break
+        return local[: max(1, limit)]
+
+    @staticmethod
+    def _expand_query(query: str) -> str:
+        expanded = [clean_text(query, limit=400)]
+        lowered = expanded[0].lower()
+        for marker, terms in TOPIC_EXPANSIONS.items():
+            if marker in lowered:
+                expanded.append(terms)
+        return " ".join(part for part in expanded if part)
+
+    def _global_style_view(self, content: str, names: list[str]) -> str:
+        _before, separator, response = content.partition("Owner response:\n")
+        value = response if separator else content
+        return "Historical owner response:\n" + self.sanitizer.anonymize_style_example(value, names=names)
 
     async def _search_scope(
         self,

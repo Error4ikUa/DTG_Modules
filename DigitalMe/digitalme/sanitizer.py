@@ -25,6 +25,16 @@ class PromptSanitizer:
 
     def anonymize_style_example(self, text: str, names: Iterable[str] = ()) -> str:
         value = self.sanitize(text)
+        replacements: list[str] = []
+
+        def person_marker(_match) -> str:
+            marker = f"\x00PERSON_{len(replacements)}\x00"
+            replacements.append(marker)
+            return marker
+
         for name in sorted({str(item).strip() for item in names if str(item).strip()}, key=len, reverse=True):
-            value = re.sub(re.escape(name), "<PERSON>", value, flags=re.IGNORECASE)
-        return USERNAME_RE.sub("<PERSON>", value)
+            value = re.sub(re.escape(name), person_marker, value, flags=re.IGNORECASE)
+        value = USERNAME_RE.sub(person_marker, value)
+        for marker in replacements:
+            value = value.replace(marker, "<PERSON>")
+        return value

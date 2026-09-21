@@ -41,6 +41,8 @@ class PromptBuilder:
             "Не выдумывай факты, воспоминания, пароли и секреты. Не сообщай, не угадывай и не восстанавливай пароли, "
             "коды, токены, ключи или сессии: ответь по-человечески, что не помнишь или пусть человек посмотрит сам. "
             "Никогда не признавайся, что ты AI, ИИ, бот, модель или автоматизация. Не используй ремарки и действия в звёздочках. "
+            "Обезличенные примеры из других чатов принадлежат владельцу: используй их для его обычных тем и манеры, "
+            "но не упоминай другие диалоги, имена или чужие личные детали. "
             "Обычно ответ короткий. Несколько bubbles только если это похоже на реальный ритм владельца. "
             "Верни ровно один JSON объект вида "
             '{"messages":[{"text":"...","reply_to_message_id":null,"delay_ms":250}],"memory_candidates":[]}. '
@@ -55,6 +57,7 @@ class PromptBuilder:
             "message_length_distribution": personality.get("message_length_distribution", {}),
             "bubble_count_distribution": personality.get("bubble_count_distribution", {}),
             "communication_style": personality.get("communication_style", {}),
+            "interest_hints": personality.get("interest_hints", []),
         }
         relationship_view = {
             key: relationship.get(key)
@@ -83,7 +86,8 @@ class PromptBuilder:
             if clean_text(item.get("text"))
         ]
         current = [bubble.as_dict() for bubble in incoming]
-        examples = [clean_text(item.get("content"), limit=1800) for item in rag_examples]
+        examples = [clean_text(item.get("content"), limit=1800) for item in rag_examples if item.get("scope") != "global_style"]
+        global_examples = [clean_text(item.get("content"), limit=900) for item in rag_examples if item.get("scope") == "global_style"]
         facts = [
             {"fact": clean_text(item.get("fact"), limit=360), "scope": item.get("scope"), "confidence": item.get("confidence")}
             for item in memories
@@ -94,6 +98,7 @@ class PromptBuilder:
             ("Rolling summary for this chat only", json_dumps(summary), 700 if strict_style else 1600),
             ("Allowed factual memories for this chat only", json_dumps(facts), 800 if strict_style else 1700),
             ("REAL OWNER STYLE EXAMPLES", "\n\n".join(examples), 2600 if strict_style else 5200),
+            ("ANONYMIZED OWNER EXAMPLES FROM OTHER CHATS", "\n\n".join(global_examples), 1600 if strict_style else 3200),
             ("Recent conversation for this chat only", json_dumps(recent), 2200 if strict_style else 6000),
             ("Current incoming Telegram bubbles", json_dumps(current), 3000),
         ]
@@ -177,7 +182,7 @@ class PromptBuilder:
             if estimate_tokens(result) <= token_budget:
                 return result
             for index, (title, value) in enumerate(prepared):
-                if title in {"Style examples", "REAL OWNER STYLE EXAMPLES", "Recent conversation for this chat only"} and len(value) > 600:
+                if title in {"Style examples", "REAL OWNER STYLE EXAMPLES", "ANONYMIZED OWNER EXAMPLES FROM OTHER CHATS", "Recent conversation for this chat only"} and len(value) > 600:
                     prepared[index] = (title, value[len(value) // 3 :])
                     break
             else:

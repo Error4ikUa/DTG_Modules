@@ -239,7 +239,7 @@ class ProviderRouter:
             content = "".join(str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content)
         text = strip_reasoning_blocks(str(content or ""))
         if not text:
-            raise ProviderError("empty_completion")
+            raise ProviderError("empty_completion", retryable=False)
         return Completion(
             content=text,
             provider=provider,
@@ -351,7 +351,9 @@ class ProviderRouter:
             raise ProviderError("ollama_unavailable") from exc
         text = strip_reasoning_blocks("".join(parts))
         if not text:
-            raise ProviderError("empty_completion")
+            # GenerationEngine replaces this with one compact recovery prompt rather
+            # than repeating the same large prompt and holding the typing indicator.
+            raise ProviderError("empty_completion", retryable=False)
         return Completion(
             content=text,
             provider="ollama",

@@ -5,9 +5,9 @@ from collections.abc import Callable
 from .database import DigitalMeDatabase
 from .memory import MemoryEvaluator
 from .prompt_builder import PromptBuilder
-from .providers import ProviderRouter
+from .providers import ProviderError, ProviderRouter
 from .rag import RAGService
-from .schemas import GenerationResult, QueueItem, parse_generation_response
+from .schemas import GeneratedBubble, GenerationResult, QueueItem, parse_generation_response
 
 
 class GenerationEngine:
@@ -32,6 +32,11 @@ class GenerationEngine:
 
     async def generate(self, item: QueueItem, *, thinking_override: bool | None = None) -> GenerationResult | None:
         current_text = "\n".join(bubble.text for bubble in item.messages)
+        quick_reply = self._quick_reply(item, current_text)
+        if quick_reply:
+            return GenerationResult(
+                messages=[GeneratedBubble(text=quick_reply, delay_ms=self._int("min_delay_ms", 250, 0, 60000))]
+            )
         recent_limit = self._int("recent_messages_limit", 40, 6, 100)
         recent = await self.database.get_recent_messages(item.chat_id, recent_limit)
         candidates = []
@@ -48,8 +53,8 @@ class GenerationEngine:
                 candidates=candidates,
                 owner_id=self.owner_id,
             )
-            completion = await self.provider.complete(
-                prompt,
+            completion = await self._complete_with_recovery(
+                prompt, item,
                 thinking_override=thinking_override,
                 max_tokens_override=self._int("fast_reply_max_tokens", 80, 64, 256),
             )
@@ -71,13 +76,16 @@ class GenerationEngine:
                 incoming=item.messages,
                 rag_examples=examples,
             )
-            completion = await self.provider.complete(prompt, thinking_override=thinking_override)
+            completion = await self._complete_with_recovery(prompt, item, thinking_override=thinking_override)
         self.last_completion = completion
+        return await self._parse_completion(completion.content, item)
+
+    async def _parse_completion(self, content: str, item: QueueItem) -> GenerationResult | None:
         reply_ids = {bubble.message_id for bubble in item.messages if bubble.message_id is not None}
         strict_style = bool(self.config_get("strict_style_mode", True))
         configured_length = self._int("max_message_length", 280, 64, 4096)
         result = parse_generation_response(
-            completion.content,
+            content,
             max_bubbles=min(self._int("max_message_bubbles", 1, 1, 12), 3) if strict_style else self._int("max_message_bubbles", 1, 1, 12),
             max_message_length=min(configured_length, 280) if strict_style else configured_length,
             min_delay_ms=self._int("min_delay_ms", 250, 0, 60000),
@@ -88,6 +96,50 @@ class GenerationEngine:
             approved = self.memory_evaluator.evaluate(result.memory_candidates, chat_id=item.chat_id, contact_id=item.sender_id)
             await self.database.add_memories(approved)
         return result
+
+    async def _complete_with_recovery(
+        self,
+        prompt: list[dict[str, str]],
+        item: QueueItem,
+        *,
+        thinking_override: bool | None,
+        max_tokens_override: int | None = None,
+    ):
+        try:
+            return await self.provider.complete(
+                prompt,
+                thinking_override=thinking_override,
+                max_tokens_override=max_tokens_override,
+            )
+        except ProviderError as exc:
+            if exc.kind != "empty_completion":
+                raise
+            # A compact recovery is far more likely to complete than repeating the
+            # same large prompt after Ollama supplied no final text.
+            recovery = self.prompt_builder.build_fast_reply(incoming=item.messages)
+            return await self.provider.complete(
+                recovery,
+                thinking_override=False,
+                max_tokens_override=self._int("fast_reply_max_tokens", 80, 64, 256),
+            )
+
+    @staticmethod
+    def _quick_reply(item: QueueItem, incoming: str) -> str | None:
+        """Fast, fresh acknowledgements for greetings; substantive chat still uses AI."""
+        normalized = " ".join(incoming.lower().replace("ё", "е").split()).strip("!?. ,")
+        variants = {
+            "привет": ("привет, че как?", "приветик, че хотел?", "о привет, как сам?"),
+            "дарова": ("дарова, че хотел?", "дарова, че как?", "о, здарова"),
+            "здарова": ("здарова, че как?", "о, здарова", "здарова, че хотел?"),
+            "ку": ("ку, че там?", "ку, че как?", "о, ку"),
+            "хай": ("привет, че как?", "о привет", "привет, че хотел?"),
+            "hello": ("привет, че как?", "о привет", "привет, че хотел?"),
+            "hi": ("привет, че как?", "о привет", "привет, че хотел?"),
+        }.get(normalized)
+        if not variants:
+            return None
+        seed = int(item.chat_id) + sum(int(bubble.message_id or 0) for bubble in item.messages)
+        return variants[seed % len(variants)]
 
     def _int(self, key: str, default: int, minimum: int, maximum: int) -> int:
         try:

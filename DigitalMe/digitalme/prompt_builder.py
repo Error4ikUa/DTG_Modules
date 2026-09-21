@@ -141,6 +141,17 @@ class PromptBuilder:
         body += "\n\nSimilar past turns:\n" + json_dumps(examples)
         return [{"role": "system", "content": system}, {"role": "user", "content": body}]
 
+    def build_fast_reply(self, *, incoming: list[InboundBubble]) -> list[dict[str, str]]:
+        """A small recovery prompt that is cheap enough for a live acknowledgement."""
+        system = (
+            "Write one fresh, short Telegram reply in the owner's observed casual style. "
+            "The examples are style hints only: never copy them verbatim. No roleplay, asterisks, secrets, "
+            "invented memories, or explanations. Return only JSON: "
+            '{"messages":[{"text":"...","reply_to_message_id":null,"delay_ms":250}],"memory_candidates":[]}.'
+        )
+        body = "Incoming:\n" + json_dumps([bubble.as_dict() for bubble in incoming])
+        return [{"role": "system", "content": system}, {"role": "user", "content": body}]
+
     def _fit_sections(self, sections: list[tuple[str, str, int]], token_budget: int) -> str:
         prepared: list[tuple[str, str]] = []
         for title, content, char_limit in sections:

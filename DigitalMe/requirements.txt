@@ -1,0 +1,4 @@
+aiohttp>=3.9.5
+aiosqlite>=0.20.0
+ijson>=3.2.3
+# Optional local semantic embeddings: sentence-transformers>=3.0.0

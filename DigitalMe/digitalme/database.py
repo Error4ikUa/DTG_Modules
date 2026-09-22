@@ -421,10 +421,17 @@ class DigitalMeDatabase:
                 last_id = int(row["id"])
                 yield dict(row)
 
-    async def get_recent_messages(self, chat_id: int, limit: int) -> list[dict[str, Any]]:
+    async def get_recent_messages(
+        self,
+        chat_id: int,
+        limit: int,
+        *,
+        exclude_generated: bool = True,
+    ) -> list[dict[str, Any]]:
+        generated_clause = " AND message_type != 'digitalme_generated'" if exclude_generated else ""
         rows = await self._fetchall(
             "SELECT chat_id, sender_id, message_id, timestamp, text, reply_to_message_id "
-            "FROM messages WHERE chat_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
+            "FROM messages WHERE chat_id = ?" + generated_clause + " ORDER BY timestamp DESC, id DESC LIMIT ?",
             (int(chat_id), max(1, int(limit))),
         )
         return [dict(row) for row in reversed(rows)]

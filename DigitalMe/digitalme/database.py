@@ -436,6 +436,16 @@ class DigitalMeDatabase:
         )
         return [dict(row) for row in reversed(rows)]
 
+    async def last_real_message(self, chat_id: int) -> dict[str, Any] | None:
+        """Return the latest non-generated dialog event for initiative decisions."""
+        row = await self._fetchone(
+            "SELECT chat_id, sender_id, message_id, timestamp, text, reply_to_message_id "
+            "FROM messages WHERE chat_id = ? AND message_type != 'digitalme_generated' "
+            "ORDER BY timestamp DESC, id DESC LIMIT 1",
+            (int(chat_id),),
+        )
+        return dict(row) if row else None
+
     async def count_messages(self, *, owner_id: int | None = None) -> int:
         if owner_id is None:
             row = await self._fetchone("SELECT COUNT(*) AS count FROM messages")

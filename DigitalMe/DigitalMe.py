@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import random
 import time
 from pathlib import Path
 
@@ -99,6 +100,11 @@ class DigitalMeMod(Module):
             ConfigValue("cross_contact_style_examples", True, "Use anonymized examples from other chats", validators.Boolean()),
             ConfigValue("observe_manual_messages", True, "Learn from new manual owner messages locally", validators.Boolean()),
             ConfigValue("observation_rebuild_seconds", 300, "Delay before rebuilding local training data", validators.Integer(minimum=30, maximum=3600)),
+            ConfigValue("twin_chat_id", 0, "Private twin chat ID allowed to receive model-initiated messages", validators.Integer(minimum=0)),
+            ConfigValue("twin_active_mode", False, "Let DigitalMe independently continue the configured twin chat", validators.Boolean()),
+            ConfigValue("twin_idle_seconds", 180, "Quiet time before the twin may initiate a message", validators.Integer(minimum=30, maximum=86400)),
+            ConfigValue("twin_pulse_min_seconds", 90, "Shortest internal twin initiative check", validators.Integer(minimum=30, maximum=3600)),
+            ConfigValue("twin_pulse_max_seconds", 240, "Longest internal twin initiative check", validators.Integer(minimum=30, maximum=7200)),
             ConfigValue("embedding_mode", "off", "off, local, remote", validators.Choice(("off", "local", "remote"))),
             ConfigValue("embedding_model", "", "Optional embedding model", validators.String(max_len=300)),
             ConfigValue("import_max_mb", 2048, "Largest accepted Telegram export", validators.Integer(minimum=10, maximum=16384)),
@@ -119,6 +125,7 @@ class DigitalMeMod(Module):
         self._last_completion = None
         self._generated_signatures: dict[tuple[int, str], float] = {}
         self._observation_task: asyncio.Task | None = None
+        self._twin_task: asyncio.Task | None = None
 
     async def client_ready(self, client, db=None) -> None:
         if self._started:
@@ -150,9 +157,14 @@ class DigitalMeMod(Module):
         self._debounce = PerChatDebounce(lambda: self._float("debounce_seconds", 2.5, 0.1, 30.0), self._enqueue_debounced)
         self._importer = TelegramExportImporter(self._database)
         self._started = True
+        self._start_twin_loop()
 
     async def on_unload(self) -> None:
         self._shutting_down = True
+        if self._twin_task:
+            self._twin_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._twin_task
         if self._importer:
             self._importer.cancel()
         if self._import_task and not self._import_task.done():
@@ -219,6 +231,33 @@ class DigitalMeMod(Module):
             for item in removed:
                 await self._database.queue_status(item.generation_id, "cancelled")
         await self._edit(event, f"<b>DigitalMe stopped.</b>\nCancelled pending tasks: <code>{len(removed)}</code>")
+
+    @command("twinlab", description="Control model-initiated conversation with the configured twin chat", usage=".twinlab [on|off|status]", security="owner")
+    async def twinlab_cmd(self, event, args) -> None:
+        action = str(args[0]).lower() if args else "status"
+        if action not in {"on", "off", "status"}:
+            await self._edit(event, "<b>Usage:</b> <code>.twinlab [on|off|status]</code>")
+            return
+        chat_id = self._twin_chat_id()
+        if action == "on":
+            if not chat_id:
+                await self._edit(event, "<b>Set a twin chat ID in DigitalMe settings first.</b>")
+                return
+            self._set_config("twin_active_mode", True)
+            self._start_twin_loop()
+        elif action == "off":
+            self._set_config("twin_active_mode", False)
+        if self._database and chat_id:
+            state = await self._database.get_setting(self._twin_state_key(chat_id), {})
+        else:
+            state = {}
+        await self._edit(
+            event,
+            "<b>DigitalMe TwinLab</b>\n"
+            f"Chat: <code>{chat_id or 'not configured'}</code>\n"
+            f"Mode: <code>{'ON' if self.config.get('twin_active_mode') else 'OFF'}</code>\n"
+            f"Last model initiative: <code>{int(state.get('last_sent_at') or 0) or 'never'}</code>",
+        )
 
     @command("aitoken", description="Save remote provider key or select local Ollama", usage=".aitoken <key> | .aitoken local [model]", security="owner")
     async def aitoken_cmd(self, event, args) -> None:
@@ -674,6 +713,83 @@ class DigitalMeMod(Module):
             await self._notify_owner("local style observer could not rebuild training data")
         finally:
             self._observation_task = None
+
+    def _twin_chat_id(self) -> int:
+        try:
+            return max(0, int(self.config.get("twin_chat_id", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _twin_state_key(chat_id: int) -> str:
+        return f"twin_activity:{int(chat_id)}"
+
+    def _start_twin_loop(self) -> None:
+        if self._twin_task and not self._twin_task.done():
+            return
+        self._twin_task = asyncio.create_task(self._twin_presence_loop())
+
+    async def _twin_presence_loop(self) -> None:
+        """Use random model-check pulses, never a fixed timer that blindly sends a message."""
+        try:
+            while not self._shutting_down:
+                minimum = int(self.config.get("twin_pulse_min_seconds", 90))
+                maximum = int(self.config.get("twin_pulse_max_seconds", 240))
+                minimum = max(30, min(3600, minimum))
+                maximum = max(minimum, min(7200, maximum))
+                await asyncio.sleep(random.uniform(minimum, maximum))
+                if not bool(self.config.get("twin_active_mode", False)):
+                    continue
+                with contextlib.suppress(ProviderError, asyncio.TimeoutError, ValueError):
+                    await self._run_twin_initiative()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._twin_task = None
+
+    async def _run_twin_initiative(self) -> None:
+        if not self._database or not self._engine or not bool(self.config.get("enabled", False)):
+            return
+        chat_id = self._twin_chat_id()
+        if not chat_id or not await self._chat_is_eligible(chat_id):
+            return
+        running, waiting = await self._queue.snapshot() if self._queue else (None, [])
+        if (running and running.chat_id == chat_id) or any(item.chat_id == chat_id for item in waiting):
+            return
+        last_real = await self._database.last_real_message(chat_id)
+        if not last_real:
+            return
+        state = await self._database.get_setting(self._twin_state_key(chat_id), {})
+        state = state if isinstance(state, dict) else {}
+        baseline = max(float(last_real.get("timestamp") or 0), float(state.get("last_sent_at") or 0))
+        idle_seconds = int(max(0, now_ts() - baseline))
+        if idle_seconds < int(self.config.get("twin_idle_seconds", 180)):
+            return
+        result = await self._engine.generate_twin_initiative(chat_id=chat_id, idle_seconds=idle_seconds)
+        self._last_completion = self._engine.last_completion
+        state["last_checked_at"] = now_ts()
+        state["last_idle_seconds"] = idle_seconds
+        if not result or not result.messages:
+            await self._database.set_setting(self._twin_state_key(chat_id), state)
+            return
+        dialog = await self._database.get_dialog(chat_id)
+        for index, bubble in enumerate(result.messages):
+            if index:
+                await asyncio.sleep(max(0, bubble.delay_ms) / 1000)
+            self._remember_generated(chat_id, bubble.text)
+            sent = await self.client.send_message(chat_id, bubble.text)
+            await self._database.insert_live_message(
+                chat_id=chat_id,
+                sender_id=self._owner_id,
+                message_id=int(getattr(sent, "id", 0) or 0) or None,
+                timestamp=now_ts(),
+                text=bubble.text,
+                reply_to_message_id=None,
+                display_name=str(dialog.get("display_name") or ""),
+                message_type="digitalme_generated",
+            )
+        state["last_sent_at"] = now_ts()
+        await self._database.set_setting(self._twin_state_key(chat_id), state)
 
     async def _generate_with_typing(self, item: QueueItem):
         action = getattr(self.client, "action", None)

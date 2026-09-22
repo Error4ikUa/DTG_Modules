@@ -11,6 +11,7 @@ from .rag import RAGService
 from .schemas import (
     GeneratedBubble,
     GenerationResult,
+    InboundBubble,
     QueueItem,
     is_automation_probe,
     is_credential_request,
@@ -108,6 +109,48 @@ class GenerationEngine:
             self.last_completion = completion
             result = await self._parse_completion(completion.content, item)
         if needs_style_retry(result) or self._reject_result(result, current_text, recent_owner_texts):
+            return None
+        return result
+
+    async def generate_twin_initiative(self, *, chat_id: int, idle_seconds: int) -> GenerationResult | None:
+        """Let the model decide whether a quiet twin chat deserves a new message."""
+        recent = await self.database.get_recent_messages(chat_id, self._int("recent_messages_limit", 16, 6, 100))
+        personality = await self.database.get_personality_profile(self.owner_id)
+        relationship = await self.database.get_relationship_profile(chat_id)
+        summary = await self.database.get_summary(chat_id)
+        prompt = self.prompt_builder.build_twin_initiative(
+            owner_id=self.owner_id,
+            personality=personality,
+            relationship=relationship,
+            summary=summary,
+            recent_messages=recent,
+            idle_seconds=idle_seconds,
+        )
+        completion = await self.provider.complete(
+            prompt,
+            thinking_override=False,
+            max_tokens_override=self._int("fast_reply_max_tokens", 80, 64, 256),
+        )
+        self.last_completion = completion
+        text = completion.content.strip().strip("`\"'")
+        if text.upper() == "SKIP":
+            return None
+        item = QueueItem(
+            chat_id=chat_id,
+            sender_id=chat_id,
+            messages=[InboundBubble(message_id=None, text="", timestamp=0)],
+            generation_id="twin_initiative",
+        )
+        result = await self._parse_completion(text, item)
+        if result is None:
+            # Runeweaver is happier with plain text than a forced JSON response.
+            result = GenerationResult(messages=[GeneratedBubble(text=text, delay_ms=250)]) if text else None
+        recent_owner_texts = [
+            str(message.get("text") or "")
+            for message in recent
+            if int(message.get("sender_id") or 0) == self.owner_id
+        ]
+        if needs_style_retry(result) or self._reject_result(result, "", recent_owner_texts):
             return None
         return result
 

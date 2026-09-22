@@ -171,6 +171,52 @@ class PromptBuilder:
         body = "Incoming:\n" + json_dumps([bubble.as_dict() for bubble in incoming])
         return [{"role": "system", "content": system}, {"role": "user", "content": body}]
 
+    def build_twin_initiative(
+        self,
+        *,
+        owner_id: int,
+        personality: dict[str, Any],
+        relationship: dict[str, Any],
+        summary: dict[str, Any],
+        recent_messages: list[dict[str, Any]],
+        idle_seconds: int,
+    ) -> list[dict[str, str]]:
+        """Ask the local model whether it naturally has something to say in the twin chat."""
+        recent = [
+            {
+                "role": "OWNER" if int(item.get("sender_id") or 0) == owner_id else "CONTACT",
+                "text": clean_text(item.get("text"), limit=500),
+            }
+            for item in recent_messages[-12:]
+            if clean_text(item.get("text"))
+        ]
+        style = {
+            "common_words": personality.get("common_words", [])[:30],
+            "slang": personality.get("slang", [])[:20],
+            "interests": personality.get("interest_hints", [])[:12],
+            "relationship": {
+                "formality": relationship.get("formality"),
+                "teasing_level": relationship.get("teasing_level"),
+                "profanity_level": relationship.get("profanity_level"),
+                "common_terms": relationship.get("common_terms", [])[:16],
+            },
+        }
+        system = (
+            "Ты продолжаешь личный Telegram-диалог в естественной манере владельца. Это проверка инициативы, "
+            "а не приказ обязательно писать. Сам реши: если нет живой причины продолжать разговор сейчас, верни ровно SKIP. "
+            "Если мысль есть, верни только одно короткое нормальное сообщение без JSON, кавычек, объяснений и ремарок. "
+            "Можно самому поднять тему из недавней беседы, спросить по-человечески или пошутить. Не будь помощником: "
+            "не предлагай помощь, не морализируй, не говори про AI, модель, бота или автоматизацию. "
+            "Не выдумывай факты и не повторяй фразы из истории дословно."
+        )
+        body = (
+            "STYLE:\n" + json_dumps(style)
+            + "\n\nCHAT SUMMARY:\n" + json_dumps(summary)
+            + "\n\nRECENT REAL DIALOG:\n" + json_dumps(recent)
+            + f"\n\nThe chat has been quiet for about {max(0, int(idle_seconds))} seconds. Decide: SKIP or one natural message."
+        )
+        return [{"role": "system", "content": system}, {"role": "user", "content": body}]
+
     def _fit_sections(self, sections: list[tuple[str, str, int]], token_budget: int) -> str:
         prepared: list[tuple[str, str]] = []
         for title, content, char_limit in sections:

@@ -64,6 +64,7 @@ class DigitalMeMod(Module):
             ConfigValue("provider", "ollama", "ollama, openrouter, openai_compatible, lm_studio", validators.Choice(("ollama", "openrouter", "openai_compatible", "lm_studio"))),
             ConfigValue("base_url", "http://127.0.0.1:11434", "Provider base URL", validators.String(max_len=500)),
             ConfigValue("enable_thinking", False, "Use a provider-native thinking mode when it is supported", validators.Boolean()),
+            ConfigValue("ollama_json_mode", False, "Force Ollama JSON mode when the selected model supports it", validators.Boolean()),
             ConfigValue("api_key", "", "Remote provider API key", validators.String(max_len=1000), secret=True),
             ConfigValue("model", "runeweaver", "Primary model", validators.String(min_len=1, max_len=200)),
             ConfigValue("owner_name", "Вова", "Name used for direct identity questions", validators.String(min_len=1, max_len=80)),

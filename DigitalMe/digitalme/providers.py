@@ -299,7 +299,6 @@ class ProviderRouter:
             "model": model,
             "messages": messages,
             "stream": True,
-            "format": "json",
             "keep_alive": self._ollama_keep_alive(),
             "options": {
                 "temperature": float(self._value("temperature", 0.8)),
@@ -307,6 +306,10 @@ class ProviderRouter:
                 "num_predict": int(max_tokens_override or self._value("max_output_tokens", 1000)),
             },
         }
+        # Some roleplay GGUF models answer only with `{}` under Ollama JSON mode.
+        # The generation parser still validates text before it can reach Telegram.
+        if bool(self._value("ollama_json_mode", False)):
+            payload["format"] = "json"
         if thinking_supported is True:
             # Native Ollama API flag; never emulate this with a prompt or CLI command.
             payload["think"] = thinking_requested

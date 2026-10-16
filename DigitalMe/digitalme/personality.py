@@ -188,7 +188,7 @@ async def build_personality_profile(database: DigitalMeDatabase, *, owner_id: in
     uppercase_messages = 0
     total_messages = 0
 
-    async for row in database.iter_messages(sender_id=owner_id, exclude_generated=True):
+    async for row in database.iter_messages(sender_id=owner_id, exclude_generated=True, include_twin_style=True):
         text = clean_text(row.get("text"))
         if not text:
             continue

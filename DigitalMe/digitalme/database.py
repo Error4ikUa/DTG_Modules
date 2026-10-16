@@ -394,6 +394,7 @@ class DigitalMeDatabase:
         chat_id: int | None = None,
         sender_id: int | None = None,
         exclude_generated: bool = False,
+        include_twin_style: bool = False,
         batch_size: int = 500,
     ) -> AsyncIterator[dict[str, Any]]:
         last_timestamp = -1.0
@@ -405,7 +406,7 @@ class DigitalMeDatabase:
                 clauses.append("chat_id = ?")
                 params.append(int(chat_id))
             if sender_id is not None:
-                clauses.append("sender_id = ?")
+                clauses.append("(sender_id = ? OR message_type = 'twin_owner')" if include_twin_style else "sender_id = ?")
                 params.append(int(sender_id))
             if exclude_generated:
                 clauses.append("message_type != 'digitalme_generated'")
@@ -430,9 +431,24 @@ class DigitalMeDatabase:
     ) -> list[dict[str, Any]]:
         generated_clause = " AND message_type != 'digitalme_generated'" if exclude_generated else ""
         rows = await self._fetchall(
-            "SELECT chat_id, sender_id, message_id, timestamp, text, reply_to_message_id "
+            "SELECT chat_id, sender_id, message_id, timestamp, text, reply_to_message_id, message_type "
             "FROM messages WHERE chat_id = ?" + generated_clause + " ORDER BY timestamp DESC, id DESC LIMIT ?",
             (int(chat_id), max(1, int(limit))),
+        )
+        return [dict(row) for row in reversed(rows)]
+
+    async def get_conversation_context(self, chat_id: int, limit: int, *, gap_seconds: int = 3600) -> list[dict[str, Any]]:
+        """Keep both speakers in the latest session, without making generated text training data."""
+        rows = await self.get_recent_messages(chat_id, limit, exclude_generated=False)
+        for index in range(len(rows) - 1, 0, -1):
+            if float(rows[index]["timestamp"]) - float(rows[index - 1]["timestamp"]) > gap_seconds:
+                return rows[index:]
+        return rows
+
+    async def get_twin_style_samples(self, chat_id: int, limit: int = 12) -> list[dict[str, Any]]:
+        rows = await self._fetchall(
+            "SELECT text FROM messages WHERE chat_id = ? AND message_type = 'twin_owner' "
+            "ORDER BY timestamp DESC, id DESC LIMIT ?", (int(chat_id), max(1, int(limit))),
         )
         return [dict(row) for row in reversed(rows)]
 

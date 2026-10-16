@@ -42,16 +42,17 @@ class GenerationEngine:
 
     async def generate(self, item: QueueItem, *, thinking_override: bool | None = None) -> GenerationResult | None:
         current_text = "\n".join(bubble.text for bubble in item.messages)
-        local = quick_reply(current_text, owner_name=str(self.config_get("owner_name", "Вова") or "Вова"))
+        is_twin = item.chat_id == self._int("twin_chat_id", 0, 0, 2**63 - 1)
+        local = None if is_twin else quick_reply(current_text, owner_name=str(self.config_get("owner_name", "Вова") or "Вова"))
         if local:
             return GenerationResult(messages=[GeneratedBubble(local, delay_ms=250)])
         if is_credential_request(current_text):
             # Credentials are never supplied, reconstructed, or sent to the provider.
             return GenerationResult(messages=[GeneratedBubble("не помню, глянь в избранном", delay_ms=250)])
-        if is_automation_probe(current_text):
+        if not is_twin and is_automation_probe(current_text):
             return GenerationResult(messages=[GeneratedBubble("сам ты ии", delay_ms=250)])
         recent_limit = self._int("recent_messages_limit", 40, 6, 100)
-        recent = await self.database.get_recent_messages(item.chat_id, recent_limit)
+        recent = await self.database.get_conversation_context(item.chat_id, recent_limit)
         personality = await self.database.get_personality_profile(self.owner_id)
         relationship = await self.database.get_relationship_profile(item.sender_id)
         candidates = []
@@ -61,7 +62,15 @@ class GenerationEngine:
                 incoming=current_text,
                 limit=min(2, self._int("retrieval_candidate_limit", 2, 1, 8)),
             )
-        if candidates:
+        if is_twin:
+            examples = await self.rag.search(current_text, chat_id=item.chat_id, contact_id=item.sender_id, limit=3)
+            samples = await self.database.get_twin_style_samples(item.chat_id)
+            prompt = self.prompt_builder.build_twin_conversation(
+                owner_id=self.owner_id, recent_messages=recent, incoming=item.messages,
+                rag_examples=examples, style_samples=samples,
+            )
+            completion = await self._complete_with_recovery(prompt, item, thinking_override=False)
+        elif candidates:
             prompt = self.prompt_builder.build_retrieval_reply(
                 incoming=item.messages,
                 recent_messages=recent,
@@ -114,16 +123,12 @@ class GenerationEngine:
 
     async def generate_twin_initiative(self, *, chat_id: int, idle_seconds: int) -> GenerationResult | None:
         """Let the model decide whether a quiet twin chat deserves a new message."""
-        recent = await self.database.get_recent_messages(chat_id, self._int("recent_messages_limit", 16, 6, 100))
-        personality = await self.database.get_personality_profile(self.owner_id)
-        relationship = await self.database.get_relationship_profile(chat_id)
-        summary = await self.database.get_summary(chat_id)
-        prompt = self.prompt_builder.build_twin_initiative(
-            owner_id=self.owner_id,
-            personality=personality,
-            relationship=relationship,
-            summary=summary,
-            recent_messages=recent,
+        recent = await self.database.get_conversation_context(chat_id, self._int("recent_messages_limit", 16, 6, 100))
+        query = "\n".join(str(row.get("text") or "") for row in recent[-3:])
+        examples = await self.rag.search(query, chat_id=chat_id, contact_id=chat_id, limit=3) if query else []
+        prompt = self.prompt_builder.build_twin_conversation(
+            owner_id=self.owner_id, recent_messages=recent, incoming=[],
+            rag_examples=examples, style_samples=await self.database.get_twin_style_samples(chat_id),
             idle_seconds=idle_seconds,
         )
         completion = await self.provider.complete(
@@ -142,9 +147,6 @@ class GenerationEngine:
             generation_id="twin_initiative",
         )
         result = await self._parse_completion(text, item)
-        if result is None:
-            # Runeweaver is happier with plain text than a forced JSON response.
-            result = GenerationResult(messages=[GeneratedBubble(text=text, delay_ms=250)]) if text else None
         recent_owner_texts = [
             str(message.get("text") or "")
             for message in recent
@@ -199,9 +201,8 @@ class GenerationEngine:
         except ProviderError as exc:
             if exc.kind != "empty_completion":
                 raise
-            # A compact recovery is far more likely to complete than repeating the
-            # same large prompt after Ollama supplied no final text.
-            recovery = self.prompt_builder.build_fast_reply(incoming=item.messages)
+            # Never recover by discarding the conversation that gives the reply meaning.
+            recovery = prompt
             return await self.provider.complete(
                 recovery,
                 thinking_override=False,

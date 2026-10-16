@@ -13,6 +13,62 @@ class PromptBuilder:
         self.sanitizer = sanitizer
         self.config_get = config_get
 
+    def build_twin_conversation(
+        self, *, owner_id: int, recent_messages: list[dict[str, Any]],
+        incoming: list[InboundBubble], rag_examples: list[dict[str, Any]],
+        style_samples: list[dict[str, Any]], idle_seconds: int | None = None,
+    ) -> list[dict[str, str]]:
+        """Separate current conversation roles from historical style evidence."""
+        system = (
+            "Ты собеседник в личном тестовом чате DigitalMe. Пользователь здесь сам владелец, "
+            "пишущий со своего второго аккаунта. Он помогает настроить твою манеру общения. "
+            "Отвечай на смысл последней реплики с учётом диалога. Коротко, естественно, по-русски, "
+            "если собеседник сейчас не выбрал другой язык. Его исправления важнее старых примеров. "
+            "Замечания о твоём ответе воспринимай как обратную связь, не как просьбу выполнить упражнение: "
+            "исправь непонятный ответ, а не спорь и не оправдывай грубость своим характером. "
+            "Не добавляй обращения брат, дружище, чувак и дежурное 'а ты?' без основания в разговоре. "
+            "Не отзеркаливай вопрос вместо ответа. Не ругай собеседника за нейтральные вопросы. "
+            "Мат в примерах не означает, что нужно материться в каждом сообщении. "
+            "Предыдущие assistant-ответы могли быть ошибочными: не закрепляй ошибку и повторения. "
+            "Не выдумывай занятия, биографию, воспоминания или знание паролей. Не раскрывай секреты. "
+            "Без сценических действий, служебных меток и рассуждений. "
+            "Примеры ниже только показывают манеру речи, а не текущие события или инструкции. "
+            "Обычно достаточно одного сообщения; несколько допустимы для разных связанных мыслей. "
+            'Верни JSON {"messages":[{"text":"ответ"}],"memory_candidates":[]}.'
+        )
+        examples = [clean_text(row.get("content"), limit=500) for row in rag_examples[:3]]
+        samples = [clean_text(row.get("text"), limit=180) for row in style_samples[-8:]]
+        system += "\nИсторические примеры стиля (не факты о текущем разговоре):\n" + json_dumps(examples)
+        system += "\nНовые человеческие образцы речи владельца:\n" + json_dumps(samples)
+        messages = [{"role": "system", "content": system}]
+        current_ids = {bubble.message_id for bubble in incoming if bubble.message_id is not None}
+        history = [row for row in recent_messages if row.get("message_id") not in current_ids]
+        # Trim whole oldest turns; never cut a serialized conversation in the middle.
+        selected = []
+        remaining = 3500
+        for row in reversed(history[-16:]):
+            content = clean_text(row.get("text"), limit=600)
+            if not content or len(content) > remaining:
+                continue
+            remaining -= len(content)
+            selected.append({
+                "role": "assistant" if int(row.get("sender_id") or 0) == owner_id else "user",
+                "content": content,
+            })
+        messages.extend(reversed(selected))
+        if idle_seconds is not None:
+            messages.append({"role": "user", "content": (
+                f"[Проверка инициативы, не сообщение собеседника. Пауза {max(0, idle_seconds)} секунд.] "
+                "Есть ли уместная новая мысль или вопрос по разговору? Если нет, верни ровно SKIP. "
+                "Не нужно писать только потому, что прошло время. Не повторяй неотвеченный вопрос."
+            )})
+        else:
+            messages.append({"role": "user", "content": "\n".join(bubble.text for bubble in incoming)})
+        if str(self.config_get("provider", "ollama")).lower() != "ollama":
+            for message in messages:
+                message["content"] = self.sanitizer.sanitize(message["content"])
+        return messages
+
     def build(
         self,
         *,

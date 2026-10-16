@@ -560,7 +560,10 @@ class DigitalMeMod(Module):
                 text=text,
                 reply_to_message_id=bubble.reply_to_message_id,
                 display_name=display_name,
+                message_type="twin_owner" if chat_id == self._twin_chat_id() and sender_id == chat_id else "message",
             )
+            if chat_id == self._twin_chat_id():
+                self._schedule_observation_rebuild()
             if not bool(self.config.get("enabled", False)) or not await self._chat_is_eligible(chat_id):
                 return
             await self._debounce.add(chat_id, sender_id, bubble)
@@ -761,11 +764,19 @@ class DigitalMeMod(Module):
             return
         state = await self._database.get_setting(self._twin_state_key(chat_id), {})
         state = state if isinstance(state, dict) else {}
+        # A model decision to initiate is not permission to keep pinging an absent person.
+        if float(state.get("last_sent_at") or 0) >= float(last_real.get("timestamp") or 0):
+            return
         baseline = max(float(last_real.get("timestamp") or 0), float(state.get("last_sent_at") or 0))
         idle_seconds = int(max(0, now_ts() - baseline))
         if idle_seconds < int(self.config.get("twin_idle_seconds", 180)):
             return
         result = await self._engine.generate_twin_initiative(chat_id=chat_id, idle_seconds=idle_seconds)
+        if (self._shutting_down or not bool(self.config.get("enabled", False))
+                or not bool(self.config.get("twin_active_mode", False))
+                or not await self._chat_is_eligible(chat_id)
+                or await self._database.last_real_message(chat_id) != last_real):
+            return
         self._last_completion = self._engine.last_completion
         state["last_checked_at"] = now_ts()
         state["last_idle_seconds"] = idle_seconds
